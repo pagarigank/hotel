@@ -1,0 +1,47 @@
+{
+  "name": "@innkeeper/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --loader ts-node/esm src/main.ts",
+    "start": "node dist/main.js",
+    "test": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@innkeeper/config-schemas": "workspace:*",
+    "@innkeeper/contracts": "workspace:*",
+    "@innkeeper/money": "workspace:*",
+    "@nestjs/common": "^11.0.5",
+    "@nestjs/core": "^11.0.5",
+    "@nestjs/platform-express": "^11.0.5",
+    "@nestjs/swagger": "^11.0.3",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^16.4.7",
+    "jsonwebtoken": "^9.0.3",
+    "kysely": "^0.27.5",
+    "pg": "^8.13.1",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0",
+    "pino-pretty": "^13.0.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "swagger-ui-express": "^5.0.1",
+    "uuidv7": "^1.0.2",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^3.0.0",
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@types/supertest": "^6.0.2",
+    "supertest": "^7.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

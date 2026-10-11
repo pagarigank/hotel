@@ -1,0 +1,27 @@
+{
+  "name": "@innkeeper/db",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "migrate": "node --loader ts-node/esm src/migrate.ts",
+    "seed": "node --loader ts-node/esm src/seed.ts",
+    "test:rls": "vitest run src/rls-leakage.test.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "kysely": "^0.27.5",
+    "pg": "^8.13.1",
+    "uuidv7": "^1.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "@innkeeper/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --loader ts-node/esm src/main.ts",
+    "start": "node dist/main.js",
+    "test": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@innkeeper/contracts": "workspace:*",
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.1",
+    "pg-boss": "^10.1.5",
+    "uuidv7": "^1.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

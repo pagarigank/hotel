@@ -1,0 +1,47 @@
+:root {
+  // Brand & Surfaces
+  --brand: #2f6fed;
+  --brand-rgb: 47, 111, 237;
+  --surface: #ffffff;
+  --surface-2: #f6f8fb;
+  --border: #e6eaf1;
+  --text: #1f2937;
+  --muted: #6b7280;
+
+  // Status Tokens (Tile Background / Accent Bar / Text) — All ≥ 4.5:1 text contrast
+  --status-vacant-clean-bg: #e8f6ee;
+  --status-vacant-clean-accent: #1f9d55;
+  --status-vacant-clean-fg: #14532d;
+
+  --status-vacant-dirty-bg: #fff4e0;
+  --status-vacant-dirty-accent: #f59e0b;
+  --status-vacant-dirty-fg: #7a4a00;
+
+  --status-inspected-bg: #e0f2fe;
+  --status-inspected-accent: #0ea5e9;
+  --status-inspected-fg: #0c4a6e;
+
+  --status-occupied-bg: #e8edff;
+  --status-occupied-accent: #3b5bdb;
+  --status-occupied-fg: #1e2a78;
+
+  --status-due-out-bg: #fde8f0;
+  --status-due-out-accent: #d6336c;
+  --status-due-out-fg: #7a1237;
+
+  --status-due-in-bg: #f1e8ff;
+  --status-due-in-accent: #7c3aed;
+  --status-due-in-fg: #4c1d95;
+
+  --status-reserved-bg: #fff9db;
+  --status-reserved-accent: #e0a800;
+  --status-reserved-fg: #5c4700;
+
+  --status-ooo-bg: #eceff3;
+  --status-ooo-accent: #6b7280;
+  --status-ooo-fg: #374151;
+
+  --status-blocked-bg: #fee2e2;
+  --status-blocked-accent: #dc2626;
+  --status-blocked-fg: #7f1d1d;
+}

@@ -1,0 +1,24 @@
+{
+  "name": "innkeeper-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Innkeeper - Multi-tenant, multi-branch hotel & property management SaaS",
+  "scripts": {
+    "build": "pnpm -r --filter \"./packages/*\" run build && pnpm -r --filter \"./apps/*\" run build",
+    "dev": "pnpm --parallel run dev",
+    "dev:api": "pnpm --filter @innkeeper/api run dev",
+    "dev:worker": "pnpm --filter @innkeeper/worker run dev",
+    "dev:web": "pnpm --filter @innkeeper/web run dev",
+    "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test",
+    "test:rls": "pnpm --filter @innkeeper/db run test:rls",
+    "db:migrate": "pnpm --filter @innkeeper/db run migrate",
+    "db:seed": "pnpm --filter @innkeeper/db run seed",
+    "ci:guard:theme": "node scripts/ci-guard-theme.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2"
+  }
+}
