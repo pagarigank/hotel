@@ -1,587 +1,2098 @@
 # Innkeeper — Functional & Technical Specification
 
-Version 1.0 · Companion to `architecture.md` (system design) and `frontend.md` (UI). Requirement IDs (`REQ-…`) are referenced from `todo.md`.
+Version 2.0 (Phase 0a Remediation Edition) · Companion to `architecture.md` (system design) and `frontend.md` (UI).
+Requirement IDs (`REQ-…`) are referenced across `todo.md` and codebase invariants.
 
 **Keywords:** MUST / SHOULD / MAY as in RFC 2119.
 
 ---
 
-## 1. Scope
+## 1. Scope & System Architecture
 
-Innkeeper manages **hotels and rental properties** for many tenant companies and their branches:
+Innkeeper is a multi-tenant, multi-branch hotel & property management platform built on **PostgreSQL 16.6+**, **NestJS 11** (modular monolith), and **React 19 + Bootstrap 5.3** (strictly light theme).
+It encompasses 9 major domain modules, 1 platform infrastructure layer, and 108 production database tables adhering to shared-schema Row-Level Security (RLS).
 
-1. **Properties & Rooms** — branches, buildings, floors, units (rooms, villas, apartments, halls), live status board.
-2. **Reservations & Front Desk** — rates, availability, bookings, groups, check-in/out, folios, night audit.
-3. **Housekeeping & Maintenance.**
-4. **Restaurant / F&B** — outlets, tables, menus, orders/KOT, billing, room charge.
-5. **Inventory** — items, warehouses, purchasing, stock movements, stock counts, recipe costing.
-6. **Accounting with vouchering** — chart of accounts, vouchers (journal/receipt/payment/…), approvals, periods, ledgers, financial statements.
-7. **Platform** — tenants, branches, users/roles, configuration, audit, billing/subscription.
-
-### 1.1 Personas
-
-| Persona | Primary needs |
-|---|---|
-| Platform admin | Create tenants, plans, support, usage |
-| Tenant owner / GM | Multi-branch KPIs, configuration, approvals |
-| Front desk agent | Board, check-in/out, reservations, folio charges |
-| Reservations manager | Rates, restrictions, groups, channels |
-| Housekeeping supervisor / attendant | Room status, tasks (mobile-first) |
-| F&B cashier / waiter / chef | Tables, orders, KOT, bill, recipes |
-| Storekeeper / purchasing | GRN, issues, counts, POs |
-| Accountant / finance manager | Vouchers, approvals, periods, reports |
-| Auditor (read-only) | Ledgers, audit trail, exports |
+1. **Platform & Tenancy** (`tenants`, `branches`, `subscriptions`, `usage_meters`, `feature_flags`)
+2. **Identity & Access Management (IAM)** (`users`, `memberships`, `roles`, `role_permissions`, `membership_roles`, `sessions`)
+3. **Configuration & Metadata** (`settings`, `custom_field_defs`, `status_defs`, `status_transitions`, `action_defs`, `numbering_sequences`, `amenities`, `buildings`, `floors`, `unit_status_log`)
+4. **Guests & Companies** (`guests`, `companies`, `guest_prefs`, `guest_consents`, `guest_identifications`, `guest_merge_log`)
+5. **Properties & Units** (`property_types`, `unit_types`, `units`)
+6. **Rates & Pricing Engine** (`rate_plans`, `rate_calendar`, `restrictions`, `packages`, `taxes`, `tax_rules`, `charge_codes`)
+7. **Reservations, Stays & Front Desk** (`reservations`, `reservation_units`, `room_type_inventory`, `reservation_nights`, `holds`, `stays`, `room_moves`, `business_dates`, `folios`, `folio_lines`, `payments`, `night_audits`, `night_audit_steps`, `kpi_snapshots`)
+8. **Housekeeping & Maintenance** (`hk_tasks`, `hk_checklists`, `maintenance_orders`, `lost_found`)
+9. **Restaurant & POS** (`outlets`, `tables`, `menu_categories`, `menu_items`, `menu_item_prices`, `modifier_groups`, `modifiers`, `orders`, `order_lines`, `kots`, `kot_lines`, `bills`, `bill_lines`, `bill_payments`, `shifts`)
+10. **Inventory & Purchasing** (`items`, `uoms`, `uom_conversions`, `warehouses`, `suppliers`, `purchase_orders`, `po_lines`, `grn`, `grn_lines`, `stock_ledger`, `stock_balances`, `stock_counts`, `stock_count_lines`, `stock_adjustments`, `stock_transfers`, `recipes`, `recipe_lines`, `fifo_layers`)
+11. **Accounting with Vouchering** (`coa_accounts`, `fiscal_years`, `fiscal_periods`, `voucher_types`, `vouchers`, `voucher_lines`, `gl_entries`, `gl_balances`, `posting_rules`, `recurring_vouchers`, `bank_reconciliations`, `bank_statements`)
+12. **Platform Infrastructure & Integrations** (`attachments`, `audit_log`, `outbox_events`, `inbox_events`, `idempotency_keys`, `webhooks`, `channel_maps`, `channel_sync_logs`, `payment_intents`)
 
 ---
 
-## 2. Terminology
+## 2. Core Architectural & Database Invariants
 
-| Term | Meaning |
-|---|---|
-| Tenant | Customer company; isolation boundary |
-| Branch | A property location (hotel/resort/venue) belonging to one tenant |
-| Unit | Any bookable physical thing: room, villa, apartment, hall |
-| Unit type | Room category (e.g. Deluxe King); carries capacity, base rate, amenities |
-| Business date | Branch accounting date; advanced only by night audit |
-| Stay | Checked-in occupancy of a reservation line |
-| Folio | Account of charges and payments for a stay, group master, or city-ledger company |
-| Voucher | Accounting document with ≥ 2 balanced lines; posts to the ledger |
-| GL entry | Immutable ledger row created when a voucher is posted |
-| WAC | Weighted average cost |
+1. **UUIDv7 Application Generation:** All table primary keys are standard `uuid` columns generated application-side using npm `uuidv7`. Database default functions (`DEFAULT uuidv7()`) are strictly forbidden to ensure portable execution on PostgreSQL 16.6+ and PostgreSQL 18 without relying on uncommitted engine extensions.
+2. **RLS Leading-Column Index Rule:** Every tenant-scoped table MUST include `tenant_id` as the unconditional leading column on all primary keys, composite unique constraints, and secondary indexes (e.g. `PRIMARY KEY (tenant_id, id)` or `PRIMARY KEY (tenant_id, warehouse_id, item_id)`). This guarantees index-level partition filtering without sequential table scans.
+3. **Double Tenant Isolation:** All tenant tables enforce `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`. RLS policies define both `USING` and `WITH CHECK` clauses bound to `app.tenant_id()`.
+4. **Branch Isolation & Restrictive Policies:** Highly sensitive financial ledgers (`vouchers`, `gl_entries`, `stock_ledger`) enforce `RESTRICTIVE` policies checking `app.branch_ids()`:
+   ```sql
+   CREATE POLICY branch_scope ON vouchers AS RESTRICTIVE
+     USING (app.branch_ids() IS NULL OR branch_id = ANY (app.branch_ids()));
+   ```
+5. **Exact Financial Precision:** All currency amounts are stored as `numeric(19,4)`. Unit costs for inventory valuation are stored as `numeric(19,6)`. Quantities are stored as `numeric(18,4)`. Floating point `number` types are strictly prohibited in application logic.
+6. **Append-Only Ledgers:** `gl_entries`, `stock_ledger`, `audit_log`, and `folio_lines` are immutable. Database triggers reject `UPDATE` and `DELETE`. Corrections are executed strictly via explicit reversing records.
+7. **Single Table Ownership:** The `Config` module strictly owns `charge_codes`, `taxes`, `tax_rules`, `posting_rules`, and `numbering_sequences`. Other modules access them via public read services or in-memory cached registries.
+8. **Reservation ↔ Stay ↔ Unit ↔ Folio Relationship Model:**
+   - `reservation_units` models room type inventory allocation and date range exclusion.
+   - `stays` models physical room occupancy and links directly to `reservation_units(id)`.
+   - `folios` models financial accounting and links to `stays(id)` and `reservations(id)`.
+9. **Folio Concurrency & Optimistic Locking:** Every folio includes `version int NOT NULL DEFAULT 1`. Line postings and settlements execute under `SELECT ... FOR UPDATE` row locks.
+10. **Night Audit Idempotency Constraint:** Unique constraint `(tenant_id, branch_id, stay_id, business_date, charge_type)` on `folio_lines` physically prevents duplicate room and tax postings.
+11. **GDPR vs Accounting Retention Harmonization:** Guest PII in `guests` is anonymized/pseudonymized upon verified erasure request, while financial records in `folios` and `gl_entries` retain immutable financial values linked to anonymized IDs.
 
 ---
 
-## 3. Platform & Multi-Tenancy Requirements
+## 3. Platform & IAM Specification
 
+### 3.1 Requirements
 | ID | Requirement |
 |---|---|
-| REQ-PLT-001 | The system MUST isolate tenant data in the database with RLS (`ENABLE`+`FORCE`, `USING`+`WITH CHECK`) in addition to application filtering. |
-| REQ-PLT-002 | A user identity MAY belong to many tenants via `memberships`; each membership has role(s) and a branch scope. |
-| REQ-PLT-003 | Users MUST switch **active branch** (or "All permitted branches") from the top bar; the choice scopes lists, board, reports and new-document defaults. |
-| REQ-PLT-004 | Tenants MUST be provisioned by self-service signup or platform admin with a **template** (hotel, resort, apartment-rental, restaurant+hotel) that seeds CoA, voucher types, statuses, charge codes, menus, roles. |
-| REQ-PLT-005 | Subscription plans MUST gate modules (feature flags) and limits (branches, units, users). |
-| REQ-PLT-006 | Every mutating action on financial, security or configuration data MUST be written to the audit log. |
-| REQ-PLT-007 | Tenant data export (CSV/JSON + attachments) and deletion workflow MUST exist. |
-| REQ-PLT-008 | The system MUST support per-branch timezone, base currency, language, date/number formats. |
+| REQ-PLT-001 | Database isolation via PostgreSQL RLS with transaction-local context (`app.tenant_id()`). |
+| REQ-PLT-002 | Multi-tenant user identities via `memberships` with branch scoping (`membership_roles.branch_scope`). |
+| REQ-PLT-003 | Top-bar active branch switcher emitting `X-Branch-Id` header validated against membership scope. |
+| REQ-PLT-004 | Self-service tenant provisioning seeding standard templates (Hotel, Resort, Apartment, Restaurant). |
+| REQ-PLT-005 | Subscription plan gating for modules (feature flags) and usage quotas (`usage_meters`). |
+| REQ-PLT-006 | Comprehensive audit logging of all security, financial, and configuration mutations. |
+| REQ-PLT-007 | Guest right-to-erasure compliance via pseudonymization preserving immutable financial ledgers. |
+| REQ-PLT-008 | Multi-currency and multi-timezone branch configurations with independent business dates. |
 
-### 3.1 Roles and permission model
-- Permission string: `<module>.<resource>.<action>` e.g. `reservation.booking.create`, `folio.charge.post`, `folio.charge.void`, `voucher.journal.approve`, `period.close`, `config.status.edit`.
-- Role = named set of permissions + **limits** (`max_discount_pct`, `max_void_amount`, `backdate_days`, `can_override_rate`).
-- Assignment: `membership_roles(membership_id, role_id, branch_scope uuid[] | 'ALL')`.
-- Default role templates (editable): Owner, GM, Front Desk, Reservations, Housekeeping, Waiter, Cashier, Chef, Storekeeper, Accountant, Auditor.
-- Segregation of duties: a user MUST NOT approve a voucher they created unless the tenant disables the rule.
+### 3.2 Platform & IAM Production DDL
+
+```sql
+-- Global identity tables (no RLS)
+CREATE TABLE tenants (
+  id uuid PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','suspended','pending_setup')),
+  plan text NOT NULL DEFAULT 'standard',
+  attrs jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz
+);
+
+CREATE TABLE users (
+  id uuid PRIMARY KEY,
+  email text NOT NULL UNIQUE,
+  password_hash text NOT NULL,
+  first_name text NOT NULL,
+  last_name text NOT NULL,
+  phone text,
+  is_platform_admin boolean NOT NULL DEFAULT false,
+  totp_secret text,
+  totp_enabled boolean NOT NULL DEFAULT false,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','invited','locked')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz
+);
+
+-- Tenant-scoped IAM tables
+CREATE TABLE memberships (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  user_id uuid NOT NULL REFERENCES users(id),
+  is_owner boolean NOT NULL DEFAULT false,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','invited','suspended')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, user_id)
+);
+CREATE INDEX memberships_tenant_idx ON memberships (tenant_id, user_id);
+
+CREATE TABLE roles (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  name text NOT NULL,
+  code text NOT NULL,
+  description text,
+  is_system boolean NOT NULL DEFAULT false,
+  max_discount_pct numeric(5,2) NOT NULL DEFAULT 0.00,
+  max_void_amount numeric(19,4) NOT NULL DEFAULT 0.0000,
+  backdate_days int NOT NULL DEFAULT 0,
+  can_override_rate boolean NOT NULL DEFAULT false,
+  version int NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX roles_tenant_idx ON roles (tenant_id, code);
+
+CREATE TABLE role_permissions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  role_id uuid NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+  permission text NOT NULL, -- e.g., 'reservation.booking.create'
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, role_id, permission)
+);
+CREATE INDEX role_permissions_tenant_idx ON role_permissions (tenant_id, role_id);
+
+CREATE TABLE membership_roles (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  membership_id uuid NOT NULL REFERENCES memberships(id) ON DELETE CASCADE,
+  role_id uuid NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+  branch_scope uuid[], -- NULL or empty means ALL permitted branches
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, membership_id, role_id)
+);
+CREATE INDEX membership_roles_tenant_idx ON membership_roles (tenant_id, membership_id);
+
+CREATE TABLE sessions (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  tenant_id uuid REFERENCES tenants(id) ON DELETE CASCADE,
+  refresh_token_hash text NOT NULL,
+  user_agent text,
+  ip_address text,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX sessions_user_idx ON sessions (user_id, expires_at);
+
+CREATE TABLE subscriptions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  tier text NOT NULL, -- 'starter', 'professional', 'enterprise'
+  status text NOT NULL CHECK (status IN ('active','past_due','cancelled','trialing')),
+  current_period_start timestamptz NOT NULL,
+  current_period_end timestamptz NOT NULL,
+  cancel_at_period_end boolean NOT NULL DEFAULT false,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id)
+);
+
+CREATE TABLE usage_meters (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  metric text NOT NULL, -- 'rooms_count', 'branches_count', 'monthly_bookings'
+  current_value int NOT NULL DEFAULT 0,
+  quota_limit int NOT NULL,
+  reset_cycle text NOT NULL DEFAULT 'monthly' CHECK (reset_cycle IN ('daily','monthly','unlimited')),
+  last_reset_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, metric)
+);
+CREATE INDEX usage_meters_tenant_idx ON usage_meters (tenant_id, metric);
+
+CREATE TABLE feature_flags (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  flag_key text NOT NULL,
+  is_enabled boolean NOT NULL DEFAULT false,
+  config_payload jsonb NOT NULL DEFAULT '{}',
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, flag_key)
+);
+CREATE INDEX feature_flags_tenant_idx ON feature_flags (tenant_id, flag_key);
+
+-- Apply RLS
+SELECT app.enable_tenant_rls('memberships');
+SELECT app.enable_tenant_rls('roles');
+SELECT app.enable_tenant_rls('role_permissions');
+SELECT app.enable_tenant_rls('membership_roles');
+SELECT app.enable_tenant_rls('subscriptions');
+SELECT app.enable_tenant_rls('usage_meters');
+SELECT app.enable_tenant_rls('feature_flags');
+```
 
 ---
 
-## 4. Configuration Engine ("everything is configurable")
+## 4. Configuration & Metadata Engine
 
-| ID | Configurable item | Scope(s) |
-|---|---|---|
-| REQ-CFG-001 | **Settings** (typed key/value: policies, toggles, thresholds) | system → tenant → branch → outlet/unit → user |
-| REQ-CFG-002 | **Property/unit types** and attributes, amenities, floors, zones | tenant/branch |
-| REQ-CFG-003 | **Unit status definitions** (code, label, colour token, icon, flags, allowed transitions) | tenant (branch override) |
-| REQ-CFG-004 | **Action definitions** (the transactional buttons shown from a tile/page): label, icon, permission, visible-when conditions, target (modal/page/wizard key), order, role visibility | tenant/branch |
-| REQ-CFG-005 | **Custom fields** on guests, reservations, units, items, vouchers, suppliers (text, number, date, select, multi, bool, file; required; show on list/print) stored in `attrs jsonb` | tenant |
-| REQ-CFG-006 | **Rate plans**, seasons, restrictions, packages, extras, cancellation/deposit/no-show policies | branch |
-| REQ-CFG-007 | **Charge codes** and groups (room, F&B, laundry, telephone, misc, tax) with tax rules and GL mapping | tenant/branch |
-| REQ-CFG-008 | **Taxes & service charges** (rate, inclusive/exclusive, compound, applicability) | tenant/branch |
-| REQ-CFG-009 | **Voucher types**, prefixes, numbering reset (yearly/monthly/never), approval workflow, print template | tenant/branch |
-| REQ-CFG-010 | **Posting rules** mapping business events to debit/credit accounts | tenant/branch |
-| REQ-CFG-011 | **Chart of accounts**, cost centres, dimensions, fiscal calendar | tenant |
-| REQ-CFG-012 | **Numbering sequences** for reservations, folios, invoices, KOT, GRN, PO, etc. | branch |
-| REQ-CFG-013 | **Housekeeping** task templates, checklists, cleaning durations, status flow | branch |
-| REQ-CFG-014 | **Restaurant**: outlets, table layouts, menus, modifiers, courses, service charge, KOT routing/printers | outlet |
-| REQ-CFG-015 | **Inventory**: UoMs, conversions, categories, valuation method, negative-stock policy, reorder rules | tenant/branch |
-| REQ-CFG-016 | **Notifications/templates** (email/SMS/WhatsApp, confirmation, folio, invoice) | tenant |
-| REQ-CFG-017 | **Navigation/menus** visible per role; dashboard widgets per role | tenant |
-| REQ-CFG-018 | **Branding**: logo, brand colour (light palette only, validated for contrast), invoice header/footer | tenant/branch |
+### 4.1 Requirements
+| ID | Requirement |
+|---|---|
+| REQ-CFG-001 | Hierarchical settings resolution: `system → tenant → branch → outlet/unit → user`. |
+| REQ-CFG-002 | Metadata catalog definitions: buildings, floors, zones, and property amenities. |
+| REQ-CFG-003 | Unit status vocabulary (`status_defs`) and state transition validation (`status_transitions`). |
+| REQ-CFG-004 | Server-driven action registry (`action_defs`) evaluating user permissions and entity status server-side. |
+| REQ-CFG-005 | Dynamic custom field schemas (`custom_field_defs`) validating entity `attrs jsonb`. |
+| REQ-CFG-006 | Gapless and cached numbering sequences (`numbering_sequences`) with row locks for legal documents. |
 
-**Rules**
-- Settings resolve most-specific-first; every setting has a JSON-Schema-typed definition, default and description in a code-owned **registry**; unknown keys are rejected.
-- Config changes are versioned (who/when/diff), take effect immediately via `config.changed` cache invalidation, and MUST NOT break historical documents (documents snapshot the values they depended on: tax %, policy text, charge code label).
-- System-owned flags on status definitions (below) are fixed so business logic stays reliable while labels/colours/extra statuses are tenant-defined.
-
-### 4.1 Status definitions (drives board colours and logic)
+### 4.2 Configuration Production DDL
 
 ```sql
+CREATE TABLE settings (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  scope_type text NOT NULL CHECK (scope_type IN ('tenant','branch','outlet','user')),
+  scope_id uuid, -- NULL for tenant scope
+  key text NOT NULL,
+  value jsonb NOT NULL,
+  version int NOT NULL DEFAULT 1,
+  updated_by uuid,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, scope_type, scope_id, key)
+);
+CREATE INDEX settings_tenant_scope_idx ON settings (tenant_id, scope_type, scope_id, key);
+
+CREATE TABLE custom_field_defs (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  entity text NOT NULL, -- 'guest','reservation','unit','item','voucher','supplier'
+  key text NOT NULL CHECK (key ~ '^[a-z][a-z0-9_]{1,40}$'),
+  label text NOT NULL,
+  type text NOT NULL CHECK (type IN ('text','number','decimal','date','select','multiselect','bool','file')),
+  required boolean NOT NULL DEFAULT false,
+  options jsonb NOT NULL DEFAULT '[]',
+  validation jsonb NOT NULL DEFAULT '{}',
+  show_in_list boolean NOT NULL DEFAULT false,
+  print boolean NOT NULL DEFAULT false,
+  sort int NOT NULL DEFAULT 0,
+  is_archived boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, entity, key)
+);
+CREATE INDEX custom_field_defs_tenant_idx ON custom_field_defs (tenant_id, entity, sort);
+
 CREATE TABLE status_defs (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid,
-  entity text NOT NULL,                 -- 'unit' | 'reservation' | 'table' | 'hk_task' | ...
-  code text NOT NULL, label text NOT NULL,
-  color_token text NOT NULL,            -- design token, e.g. 'status-vacant-clean'
-  icon text, sort int DEFAULT 0,
-  is_sellable boolean DEFAULT false,    -- counts as available inventory
-  is_occupied boolean DEFAULT false,
-  is_dirty boolean DEFAULT false,
-  blocks_booking boolean DEFAULT false, -- OOO/OOS
-  system_key text,                      -- binds to engine behaviour, nullable for custom
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  entity text NOT NULL, -- 'unit','reservation','table','hk_task'
+  code text NOT NULL,
+  label text NOT NULL,
+  color_token text NOT NULL,
+  icon text,
+  sort int NOT NULL DEFAULT 0,
+  is_sellable boolean NOT NULL DEFAULT false,
+  is_occupied boolean NOT NULL DEFAULT false,
+  is_dirty boolean NOT NULL DEFAULT false,
+  blocks_booking boolean NOT NULL DEFAULT false,
+  system_key text,
+  created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, branch_id, entity, code)
 );
-```
+CREATE INDEX status_defs_tenant_idx ON status_defs (tenant_id, entity, sort);
 
-Default unit statuses (editable labels/colours): `vacant_clean`, `vacant_dirty`, `inspected`, `occupied`, `due_out`, `due_in` (derived), `reserved`, `out_of_order`, `out_of_service`, `blocked`, plus tenant-defined.
-
-### 4.2 Action definitions (tile/page buttons)
-
-```sql
-CREATE TABLE action_defs (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid,
-  entity text NOT NULL,                 -- 'unit' | 'reservation' | 'folio' | 'table' | 'page:board' ...
-  code text NOT NULL,                   -- 'check_in', 'post_charge', 'new_reservation' ...
-  label text NOT NULL, icon text, sort int DEFAULT 0,
-  group_code text,                      -- menu grouping/divider
+CREATE TABLE status_transitions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  entity text NOT NULL,
+  from_code text NOT NULL,
+  to_code text NOT NULL,
   permission text NOT NULL,
-  visible_when jsonb NOT NULL DEFAULT '{}',   -- {"status_in":["due_in","vacant_clean"],"has_reservation_today":true}
-  target jsonb NOT NULL,                -- {"type":"wizard","key":"check-in"} | {"type":"route","to":"/folio/:id"}
-  enabled boolean DEFAULT true,
+  requires_reason boolean NOT NULL DEFAULT false,
+  UNIQUE (tenant_id, entity, from_code, to_code)
+);
+CREATE INDEX status_transitions_tenant_idx ON status_transitions (tenant_id, entity);
+
+CREATE TABLE action_defs (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  entity text NOT NULL,
+  code text NOT NULL,
+  label text NOT NULL,
+  icon text,
+  sort int NOT NULL DEFAULT 0,
+  group_code text,
+  permission text NOT NULL,
+  visible_when jsonb NOT NULL DEFAULT '{}',
+  target jsonb NOT NULL,
+  enabled boolean NOT NULL DEFAULT true,
   UNIQUE (tenant_id, branch_id, entity, code)
 );
-```
+CREATE INDEX action_defs_tenant_idx ON action_defs (tenant_id, entity, sort);
 
-`GET /ui/actions?entity=unit&id=<uuid>` evaluates `visible_when` + user permissions + module flags server-side and returns the ordered, ready-to-render action list. The client NEVER decides authorisation.
+CREATE TABLE numbering_sequences (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  doc_type text NOT NULL, -- 'reservation','folio','invoice','voucher_jv','kot','grn'
+  prefix text NOT NULL,
+  pattern text NOT NULL DEFAULT '{PREFIX}-{YYYY}-{#6}',
+  reset_policy text NOT NULL DEFAULT 'yearly' CHECK (reset_policy IN ('daily','monthly','yearly','never')),
+  current_period text NOT NULL DEFAULT '',
+  next_no bigint NOT NULL DEFAULT 1,
+  is_gapless boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, doc_type)
+);
+CREATE INDEX numbering_sequences_tenant_idx ON numbering_sequences (tenant_id, doc_type);
+
+CREATE TABLE amenities (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  icon text,
+  category text NOT NULL DEFAULT 'room',
+  sort int NOT NULL DEFAULT 0,
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX amenities_tenant_idx ON amenities (tenant_id, category);
+
+CREATE TABLE buildings (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL,
+  code text NOT NULL,
+  name text NOT NULL,
+  sort int NOT NULL DEFAULT 0,
+  UNIQUE (tenant_id, branch_id, code)
+);
+CREATE INDEX buildings_tenant_idx ON buildings (tenant_id, branch_id);
+
+CREATE TABLE floors (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL,
+  building_id uuid REFERENCES buildings(id) ON DELETE CASCADE,
+  number text NOT NULL,
+  name text NOT NULL,
+  sort int NOT NULL DEFAULT 0,
+  UNIQUE (tenant_id, branch_id, number)
+);
+CREATE INDEX floors_tenant_idx ON floors (tenant_id, branch_id);
+
+CREATE TABLE unit_status_log (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL,
+  unit_id uuid NOT NULL,
+  from_status text NOT NULL,
+  to_status text NOT NULL,
+  reason text,
+  changed_by uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX unit_status_log_tenant_idx ON unit_status_log (tenant_id, unit_id, created_at DESC);
+
+SELECT app.enable_tenant_rls('settings');
+SELECT app.enable_tenant_rls('custom_field_defs');
+SELECT app.enable_tenant_rls('status_defs');
+SELECT app.enable_tenant_rls('status_transitions');
+SELECT app.enable_tenant_rls('action_defs');
+SELECT app.enable_tenant_rls('numbering_sequences');
+SELECT app.enable_tenant_rls('amenities');
+SELECT app.enable_tenant_rls('buildings');
+SELECT app.enable_tenant_rls('floors');
+SELECT app.enable_tenant_rls('unit_status_log');
+```
 
 ---
 
-## 5. Properties & Rooms
+## 5. Guests & Company Accounts
 
+### 5.1 Requirements & Deduplication Strategy
 | ID | Requirement |
 |---|---|
-| REQ-PRP-001 | Branch hierarchy: Branch → Building → Floor → Unit; units may be grouped (suite = connecting rooms, villa with sub-units). |
-| REQ-PRP-002 | Unit kinds: `room`, `villa`, `apartment`, `hall`, `bed` (dorm), `other` — extensible via lookup. |
-| REQ-PRP-003 | Unit type defines capacity (adults/children/extra beds), amenities, base rate, photos, size, view, bed config. |
-| REQ-PRP-004 | Each unit has one **operational status** (status_defs) plus derived flags: due-in, due-out, stay-over, VIP, DND, has-alert. |
-| REQ-PRP-005 | Status transitions MUST follow configured allowed transitions and be logged (who/when/why) in `unit_status_log`. |
-| REQ-PRP-006 | Out-of-order/out-of-service blocks MUST take units out of inventory for a date range with reason and auto-return. |
-| REQ-PRP-007 | Bulk operations: change status for selection, create units by pattern (floor 3, 301–320), copy type settings. |
-| REQ-PRP-008 | Long-stay/monthly rental properties MUST be supported (recurring rent billing via rate plan `billing_cycle`). |
+| REQ-GST-001 | Unified Guest & Company profiles with tax identification numbers (TIN) and billing details. |
+| REQ-GST-002 | Automated duplicate detection via normalized email, phone (E.164), and government ID hash. |
+| REQ-GST-003 | Historical merge audit log (`guest_merge_log`) re-pointing stays, reservations, and folios. |
+| REQ-GST-004 | GDPR consent management tracking privacy preferences, marketing opt-ins, and right-to-erasure pseudonymization. |
 
-### 5.1 Core tables
+### 5.2 Guests & Companies Production DDL
+
+```sql
+CREATE TABLE guests (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  first_name text NOT NULL,
+  last_name text NOT NULL,
+  email text,
+  email_normalized text,
+  phone text,
+  phone_e164 text,
+  birth_date date,
+  nationality char(2),
+  vip_status text NOT NULL DEFAULT 'standard' CHECK (vip_status IN ('standard','silver','gold','platinum','blacklist')),
+  notes text,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  is_pseudonymized boolean NOT NULL DEFAULT false,
+  merged_into_id uuid REFERENCES guests(id),
+  version int NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by uuid,
+  updated_at timestamptz,
+  updated_by uuid
+);
+CREATE INDEX guests_tenant_email_idx ON guests (tenant_id, email_normalized) WHERE merged_into_id IS NULL;
+CREATE INDEX guests_tenant_phone_idx ON guests (tenant_id, phone_e164) WHERE merged_into_id IS NULL;
+
+CREATE TABLE companies (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  name text NOT NULL,
+  tax_identifier text, -- TIN / VAT Reg No
+  billing_email text,
+  phone text,
+  address jsonb NOT NULL DEFAULT '{}',
+  credit_limit numeric(19,4) NOT NULL DEFAULT 0.0000,
+  credit_terms_days int NOT NULL DEFAULT 30,
+  is_active boolean NOT NULL DEFAULT true,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  version int NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz
+);
+CREATE INDEX companies_tenant_name_idx ON companies (tenant_id, name);
+
+CREATE TABLE guest_prefs (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  guest_id uuid NOT NULL REFERENCES guests(id) ON DELETE CASCADE,
+  category text NOT NULL, -- 'room','pillow','diet','floor'
+  preference text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, guest_id, category, preference)
+);
+CREATE INDEX guest_prefs_tenant_idx ON guest_prefs (tenant_id, guest_id);
+
+CREATE TABLE guest_consents (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  guest_id uuid NOT NULL REFERENCES guests(id) ON DELETE CASCADE,
+  consent_type text NOT NULL, -- 'terms_of_service','marketing_email','marketing_sms','data_processing'
+  is_granted boolean NOT NULL,
+  granted_at timestamptz NOT NULL DEFAULT now(),
+  ip_address text,
+  user_agent text
+);
+CREATE INDEX guest_consents_tenant_idx ON guest_consents (tenant_id, guest_id);
+
+CREATE TABLE guest_identifications (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  guest_id uuid NOT NULL REFERENCES guests(id) ON DELETE CASCADE,
+  id_type text NOT NULL, -- 'passport','national_id','drivers_license'
+  id_number_hash text NOT NULL, -- SHA-256 for duplicate matching
+  id_number_encrypted text NOT NULL, -- Encrypted at rest
+  issuing_country char(2) NOT NULL,
+  expiry_date date,
+  verified_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, id_type, id_number_hash)
+);
+CREATE INDEX guest_identifications_tenant_idx ON guest_identifications (tenant_id, guest_id);
+
+CREATE TABLE guest_merge_log (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  source_guest_id uuid NOT NULL,
+  target_guest_id uuid NOT NULL REFERENCES guests(id),
+  merged_by uuid NOT NULL,
+  reason text NOT NULL,
+  snapshot jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX guest_merge_log_tenant_idx ON guest_merge_log (tenant_id, target_guest_id);
+
+SELECT app.enable_tenant_rls('guests');
+SELECT app.enable_tenant_rls('companies');
+SELECT app.enable_tenant_rls('guest_prefs');
+SELECT app.enable_tenant_rls('guest_consents');
+SELECT app.enable_tenant_rls('guest_identifications');
+SELECT app.enable_tenant_rls('guest_merge_log');
+```
+
+---
+
+## 6. Properties & Units
+
+### 6.1 Requirements
+| ID | Requirement |
+|---|---|
+| REQ-PRP-001 | Multi-level property structures: Branch ➔ Building ➔ Floor ➔ Units. |
+| REQ-PRP-002 | Physical bookable kinds: `room`, `suite`, `villa`, `apartment`, `dorm_bed`, `hall`. |
+| REQ-PRP-003 | Unit type capacity constraints, amenities inheritance, base rate definitions. |
+| REQ-PRP-004 | Unit board read model (`GET /branches/:b/board`) supporting ETag and floor grouping. |
+
+### 6.2 Properties & Units Production DDL
 
 ```sql
 CREATE TABLE branches (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL REFERENCES tenants,
-  code text NOT NULL, name text NOT NULL, timezone text NOT NULL,
-  base_currency char(3) NOT NULL, business_date date NOT NULL,
-  address jsonb, attrs jsonb DEFAULT '{}', active boolean DEFAULT true,
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  timezone text NOT NULL,
+  base_currency char(3) NOT NULL,
+  business_date date NOT NULL,
+  address jsonb NOT NULL DEFAULT '{}',
+  attrs jsonb NOT NULL DEFAULT '{}',
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
   UNIQUE (tenant_id, code)
 );
+CREATE INDEX branches_tenant_idx ON branches (tenant_id, code);
+
+CREATE TABLE property_types (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX property_types_tenant_idx ON property_types (tenant_id);
 
 CREATE TABLE unit_types (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL REFERENCES branches,
-  code text NOT NULL, name text NOT NULL, kind text NOT NULL DEFAULT 'room',
-  max_adults int NOT NULL, max_children int DEFAULT 0, max_occupancy int NOT NULL,
-  base_rate numeric(19,4), sort int DEFAULT 0, attrs jsonb DEFAULT '{}',
-  UNIQUE (branch_id, code)
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  kind text NOT NULL DEFAULT 'room',
+  max_adults int NOT NULL,
+  max_children int NOT NULL DEFAULT 0,
+  max_occupancy int NOT NULL,
+  base_rate numeric(19,4) NOT NULL DEFAULT 0.0000,
+  amenities_ids uuid[] DEFAULT '{}',
+  sort int NOT NULL DEFAULT 0,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, branch_id, code)
 );
+CREATE INDEX unit_types_tenant_idx ON unit_types (tenant_id, branch_id, code);
 
 CREATE TABLE units (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL REFERENCES branches,
-  unit_type_id uuid NOT NULL REFERENCES unit_types,
-  building text, floor text, number text NOT NULL, name text,
-  status_code text NOT NULL, status_changed_at timestamptz DEFAULT now(),
-  is_sellable boolean DEFAULT true, attrs jsonb DEFAULT '{}',
-  version int DEFAULT 1, deleted_at timestamptz,
-  UNIQUE (branch_id, number)
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  unit_type_id uuid NOT NULL REFERENCES unit_types(id),
+  building text,
+  floor text,
+  number text NOT NULL,
+  name text,
+  status_code text NOT NULL DEFAULT 'vacant_dirty',
+  status_changed_at timestamptz NOT NULL DEFAULT now(),
+  is_sellable boolean NOT NULL DEFAULT true,
+  connecting_unit_id uuid REFERENCES units(id),
+  attrs jsonb NOT NULL DEFAULT '{}',
+  version int NOT NULL DEFAULT 1,
+  deleted_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, branch_id, number)
 );
-CREATE INDEX units_board_idx ON units (tenant_id, branch_id, floor, number) WHERE deleted_at IS NULL;
+CREATE INDEX units_tenant_board_idx ON units (tenant_id, branch_id, floor, number) WHERE deleted_at IS NULL;
+
+SELECT app.enable_tenant_rls('branches');
+SELECT app.enable_tenant_rls('property_types');
+SELECT app.enable_tenant_rls('unit_types');
+SELECT app.enable_tenant_rls('units');
 ```
 
 ---
 
-## 6. Reservations & Front Desk
+## 7. Rates & Pricing Engine
 
-### 6.1 Requirements
-
+### 7.1 Requirements
 | ID | Requirement |
 |---|---|
-| REQ-RSV-001 | Search availability by branch, dates, occupancy, unit type, rate plan, with price breakdown per night. |
-| REQ-RSV-002 | Create reservation with ≥1 stay lines (unit type or specific unit, dates, guests, rate plan), guest(s), company/agent, source/channel, notes, custom fields. |
-| REQ-RSV-003 | The system MUST NOT allow two active stays on the same unit with overlapping `[check_in, check_out)`; enforced by DB exclusion constraint. |
-| REQ-RSV-004 | Unassigned bookings MUST respect `room_type_inventory` capacity (+ configurable overbooking allowance per type/date). |
-| REQ-RSV-005 | Reservation statuses: `hold → confirmed → in_house → checked_out`; terminal alternatives `cancelled`, `no_show`. Holds expire automatically. |
-| REQ-RSV-006 | Modify (dates, type, unit, guests, rate) with re-pricing preview and audit; room move during stay with rate-change option. |
-| REQ-RSV-007 | Rate plans: BAR, corporate, package, member, long-stay, seasonal; restrictions: min/max LOS, CTA, CTD, stop-sell, advance-purchase, day-of-week. |
-| REQ-RSV-008 | Policies: deposit (amount/%/nights, due date), cancellation windows and fees, no-show fee — all configurable per rate plan and snapshotted on the reservation. |
-| REQ-RSV-009 | Group/block bookings with rooming list, master folio, cut-off date, pick-up tracking, release. |
-| REQ-RSV-010 | Waitlist and quotation (non-binding) with convert-to-booking. |
-| REQ-RSV-011 | Check-in: ID capture, registration card, payment method/token, unit assignment, key issue event; requires unit status per policy (e.g. `vacant_clean`/`inspected`). Early check-in rules configurable. |
-| REQ-RSV-012 | Check-out: folio review, split bills, settle by payments / city ledger, invoice generation, late-checkout fee, unit → dirty + HK task. |
-| REQ-RSV-013 | **Night audit** per branch (§6.4). |
-| REQ-RSV-014 | Walk-in quick booking (≤ 3 clicks from a vacant tile). |
-| REQ-RSV-015 | Public booking-engine API and OTA inbound reservations (adapter) MUST use the same availability rules. |
+| REQ-RAT-001 | Seasonal rate calendar with day-of-week rate overrides and extra person surcharges. |
+| REQ-RAT-002 | Booking restrictions: Min/Max LOS, Closed to Arrival (CTA), Closed to Departure (CTD), Stop-Sell. |
+| REQ-RAT-003 | Tax and service charge calculation rules (inclusive/exclusive, compounding, rounding modes). |
+| REQ-RAT-004 | Standard hospitality charge codes mapped to GL accounts via posting rules. |
 
-### 6.2 Core tables
+### 7.2 Rates & Pricing Production DDL
+
+```sql
+CREATE TABLE rate_plans (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  currency char(3) NOT NULL,
+  is_active boolean NOT NULL DEFAULT true,
+  policy_cancellation jsonb NOT NULL DEFAULT '{}',
+  policy_deposit jsonb NOT NULL DEFAULT '{}',
+  policy_no_show jsonb NOT NULL DEFAULT '{}',
+  attrs jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, branch_id, code)
+);
+CREATE INDEX rate_plans_tenant_idx ON rate_plans (tenant_id, branch_id);
+
+CREATE TABLE rate_calendar (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  rate_plan_id uuid NOT NULL REFERENCES rate_plans(id) ON DELETE CASCADE,
+  unit_type_id uuid NOT NULL REFERENCES unit_types(id) ON DELETE CASCADE,
+  stay_date date NOT NULL,
+  rate numeric(19,4) NOT NULL,
+  single_occupancy_rate numeric(19,4),
+  extra_adult_rate numeric(19,4) NOT NULL DEFAULT 0.0000,
+  extra_child_rate numeric(19,4) NOT NULL DEFAULT 0.0000,
+  UNIQUE (tenant_id, branch_id, rate_plan_id, unit_type_id, stay_date)
+);
+CREATE INDEX rate_calendar_tenant_idx ON rate_calendar (tenant_id, branch_id, stay_date);
+
+CREATE TABLE restrictions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  rate_plan_id uuid NOT NULL REFERENCES rate_plans(id) ON DELETE CASCADE,
+  unit_type_id uuid REFERENCES unit_types(id) ON DELETE CASCADE,
+  stay_date date NOT NULL,
+  min_los int,
+  max_los int,
+  closed_to_arrival boolean NOT NULL DEFAULT false,
+  closed_to_departure boolean NOT NULL DEFAULT false,
+  stop_sell boolean NOT NULL DEFAULT false,
+  UNIQUE (tenant_id, branch_id, rate_plan_id, unit_type_id, stay_date)
+);
+CREATE INDEX restrictions_tenant_idx ON restrictions (tenant_id, branch_id, stay_date);
+
+CREATE TABLE packages (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  charge_code_id uuid NOT NULL,
+  price numeric(19,4) NOT NULL,
+  frequency text NOT NULL DEFAULT 'per_stay' CHECK (frequency IN ('per_stay','per_night','per_person_per_night')),
+  is_inclusive boolean NOT NULL DEFAULT false,
+  UNIQUE (tenant_id, branch_id, code)
+);
+CREATE INDEX packages_tenant_idx ON packages (tenant_id, branch_id);
+
+CREATE TABLE taxes (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  rate_pct numeric(7,4) NOT NULL,
+  is_flat_amount boolean NOT NULL DEFAULT false,
+  flat_amount numeric(19,4) NOT NULL DEFAULT 0.0000,
+  currency char(3),
+  gl_account_code text NOT NULL,
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX taxes_tenant_idx ON taxes (tenant_id, code);
+
+CREATE TABLE tax_rules (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  code text NOT NULL,
+  name text NOT NULL,
+  is_inclusive boolean NOT NULL DEFAULT false,
+  calculation_order int NOT NULL DEFAULT 1,
+  compounds_previous boolean NOT NULL DEFAULT false,
+  tax_ids uuid[] NOT NULL, -- Ordered taxes to apply
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, code)
+);
+CREATE INDEX tax_rules_tenant_idx ON tax_rules (tenant_id, branch_id);
+
+CREATE TABLE charge_codes (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  code text NOT NULL,
+  name text NOT NULL,
+  charge_group text NOT NULL CHECK (charge_group IN ('room','fnb','laundry','telephone','spa','misc','tax','service')),
+  tax_rule_id uuid REFERENCES tax_rules(id),
+  gl_account_code text NOT NULL,
+  allow_discount boolean NOT NULL DEFAULT true,
+  department text NOT NULL DEFAULT 'rooms',
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, branch_id, code)
+);
+CREATE INDEX charge_codes_tenant_idx ON charge_codes (tenant_id, charge_group);
+
+SELECT app.enable_tenant_rls('rate_plans');
+SELECT app.enable_tenant_rls('rate_calendar');
+SELECT app.enable_tenant_rls('restrictions');
+SELECT app.enable_tenant_rls('packages');
+SELECT app.enable_tenant_rls('taxes');
+SELECT app.enable_tenant_rls('tax_rules');
+SELECT app.enable_tenant_rls('charge_codes');
+```
+
+---
+
+## 8. Reservations, Stays & Front Desk
+
+### 8.1 Requirements
+| ID | Requirement |
+|---|---|
+| REQ-RSV-001 | Availability search across dates and guest occupancies with real-time price quotes. |
+| REQ-RSV-002 | Booking creation requiring `Idempotency-Key` preventing duplicate inventory decrements. |
+| REQ-RSV-003 | Exclusion constraint on `reservation_units` strictly preventing double-booking of assigned units. |
+| REQ-RSV-004 | Capacity tracking via `room_type_inventory` with `CHECK (sold <= capacity + overbook_allowance)`. |
+| REQ-RSV-005 | Explicit separation of booking allocation (`reservation_units`) and guest physical occupancy (`stays`). |
+| REQ-RSV-006 | Check-in verification requiring clean unit status, digital registration card, and payment token capture. |
+| REQ-RSV-007 | Resumable step-checkpointed Night Audit state machine executing idempotent room and tax postings. |
+
+### 8.2 Reservations & Operations Production DDL
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 CREATE TABLE reservations (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL,
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
   reservation_no text NOT NULL,
   status text NOT NULL CHECK (status IN ('hold','confirmed','in_house','checked_out','cancelled','no_show')),
-  guest_id uuid NOT NULL REFERENCES guests, company_id uuid, source text, channel_ref text,
-  hold_expires_at timestamptz, policy_snapshot jsonb NOT NULL,
-  notes text, attrs jsonb DEFAULT '{}', version int DEFAULT 1,
-  created_at timestamptz DEFAULT now(), created_by uuid,
-  UNIQUE (branch_id, reservation_no)
+  guest_id uuid NOT NULL REFERENCES guests(id),
+  company_id uuid REFERENCES companies(id),
+  source text NOT NULL DEFAULT 'direct',
+  channel_ref text,
+  hold_expires_at timestamptz,
+  policy_snapshot jsonb NOT NULL,
+  notes text,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  version int NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by uuid,
+  updated_at timestamptz,
+  updated_by uuid,
+  UNIQUE (tenant_id, branch_id, reservation_no)
 );
+CREATE INDEX reservations_tenant_idx ON reservations (tenant_id, branch_id, status);
 
-CREATE TABLE reservation_units (               -- stay lines
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL,
-  reservation_id uuid NOT NULL REFERENCES reservations,
-  unit_type_id uuid NOT NULL, unit_id uuid REFERENCES units,   -- NULL until assigned
-  rate_plan_id uuid NOT NULL,
-  check_in date NOT NULL, check_out date NOT NULL CHECK (check_out > check_in),
-  adults int NOT NULL, children int DEFAULT 0,
-  status text NOT NULL,                        -- mirrors reservation active-ness
+CREATE TABLE reservation_units (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  reservation_id uuid NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+  unit_type_id uuid NOT NULL REFERENCES unit_types(id),
+  unit_id uuid REFERENCES units(id),
+  rate_plan_id uuid NOT NULL REFERENCES rate_plans(id),
+  check_in date NOT NULL,
+  check_out date NOT NULL CHECK (check_out > check_in),
+  adults int NOT NULL,
+  children int NOT NULL DEFAULT 0,
+  status text NOT NULL CHECK (status IN ('hold','confirmed','in_house','checked_out','cancelled','no_show')),
+  created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT no_double_booking EXCLUDE USING gist (
     unit_id WITH =, daterange(check_in, check_out, '[)') WITH &&
   ) WHERE (unit_id IS NOT NULL AND status IN ('hold','confirmed','in_house'))
 );
+CREATE INDEX reservation_units_tenant_idx ON reservation_units (tenant_id, branch_id, unit_id);
 
 CREATE TABLE room_type_inventory (
-  tenant_id uuid NOT NULL, branch_id uuid NOT NULL, unit_type_id uuid NOT NULL, stay_date date NOT NULL,
-  capacity int NOT NULL, sold int NOT NULL DEFAULT 0, overbook_allowance int NOT NULL DEFAULT 0,
-  stop_sell boolean DEFAULT false,
-  PRIMARY KEY (branch_id, unit_type_id, stay_date),
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  unit_type_id uuid NOT NULL REFERENCES unit_types(id),
+  stay_date date NOT NULL,
+  capacity int NOT NULL,
+  sold int NOT NULL DEFAULT 0,
+  overbook_allowance int NOT NULL DEFAULT 0,
+  stop_sell boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (tenant_id, branch_id, unit_type_id, stay_date),
   CHECK (sold >= 0 AND sold <= capacity + overbook_allowance)
 );
+CREATE INDEX room_type_inventory_tenant_idx ON room_type_inventory (tenant_id, branch_id, stay_date);
 
-CREATE TABLE reservation_nights (               -- priced nights (snapshot)
-  reservation_unit_id uuid NOT NULL, stay_date date NOT NULL,
-  rate numeric(19,4) NOT NULL, tax_snapshot jsonb, PRIMARY KEY (reservation_unit_id, stay_date)
+CREATE TABLE reservation_nights (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  reservation_unit_id uuid NOT NULL REFERENCES reservation_units(id) ON DELETE CASCADE,
+  stay_date date NOT NULL,
+  rate numeric(19,4) NOT NULL,
+  tax_snapshot jsonb NOT NULL DEFAULT '[]',
+  PRIMARY KEY (tenant_id, reservation_unit_id, stay_date)
 );
+CREATE INDEX reservation_nights_tenant_idx ON reservation_nights (tenant_id, reservation_unit_id);
+
+CREATE TABLE holds (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  reservation_unit_id uuid NOT NULL REFERENCES reservation_units(id) ON DELETE CASCADE,
+  session_id text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX holds_tenant_expiry_idx ON holds (tenant_id, expires_at);
+
+CREATE TABLE stays (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  reservation_id uuid NOT NULL REFERENCES reservations(id),
+  reservation_unit_id uuid NOT NULL REFERENCES reservation_units(id),
+  unit_id uuid NOT NULL REFERENCES units(id),
+  guest_id uuid NOT NULL REFERENCES guests(id),
+  actual_check_in timestamptz NOT NULL DEFAULT now(),
+  expected_check_out date NOT NULL,
+  actual_check_out timestamptz,
+  status text NOT NULL DEFAULT 'in_house' CHECK (status IN ('in_house','checked_out')),
+  reg_card_pdf_url text,
+  keycard_code text,
+  version int NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz
+);
+CREATE INDEX stays_tenant_unit_idx ON stays (tenant_id, branch_id, unit_id, status);
+
+CREATE TABLE room_moves (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  stay_id uuid NOT NULL REFERENCES stays(id),
+  from_unit_id uuid NOT NULL REFERENCES units(id),
+  to_unit_id uuid NOT NULL REFERENCES units(id),
+  reason text NOT NULL,
+  rate_adjustment numeric(19,4) NOT NULL DEFAULT 0.0000,
+  moved_by uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX room_moves_tenant_stay_idx ON room_moves (tenant_id, stay_id);
+
+CREATE TABLE business_dates (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  business_date date NOT NULL,
+  opened_at timestamptz NOT NULL DEFAULT now(),
+  closed_at timestamptz,
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','rolling','closed')),
+  UNIQUE (tenant_id, branch_id, business_date)
+);
+CREATE INDEX business_dates_tenant_idx ON business_dates (tenant_id, branch_id, business_date DESC);
+
+CREATE TABLE night_audits (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  business_date date NOT NULL,
+  status text NOT NULL CHECK (status IN ('pending','running','completed','failed')),
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  failed_at_step text,
+  error_message text,
+  run_by uuid NOT NULL,
+  UNIQUE (tenant_id, branch_id, business_date)
+);
+CREATE INDEX night_audits_tenant_idx ON night_audits (tenant_id, branch_id, business_date DESC);
+
+CREATE TABLE night_audit_steps (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  night_audit_id uuid NOT NULL REFERENCES night_audits(id) ON DELETE CASCADE,
+  step_name text NOT NULL, -- 'pre_checks','room_tax_posting','fee_posting','date_roll','gl_vouchering','kpi_snapshot'
+  status text NOT NULL CHECK (status IN ('pending','running','completed','failed','skipped')),
+  records_processed int NOT NULL DEFAULT 0,
+  error_details text,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  UNIQUE (tenant_id, night_audit_id, step_name)
+);
+CREATE INDEX night_audit_steps_tenant_idx ON night_audit_steps (tenant_id, night_audit_id);
+
+CREATE TABLE kpi_snapshots (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  business_date date NOT NULL,
+  total_units int NOT NULL,
+  occupied_units int NOT NULL,
+  ooo_units int NOT NULL,
+  complimentary_units int NOT NULL,
+  occupancy_rate numeric(6,4) NOT NULL, -- e.g. 0.7550
+  adr numeric(19,4) NOT NULL,
+  revpar numeric(19,4) NOT NULL,
+  trevpar numeric(19,4) NOT NULL,
+  total_room_revenue numeric(19,4) NOT NULL,
+  total_fnb_revenue numeric(19,4) NOT NULL,
+  total_other_revenue numeric(19,4) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, business_date)
+);
+CREATE INDEX kpi_snapshots_tenant_idx ON kpi_snapshots (tenant_id, branch_id, business_date DESC);
+
+SELECT app.enable_tenant_rls('reservations');
+SELECT app.enable_tenant_rls('reservation_units');
+SELECT app.enable_tenant_rls('room_type_inventory');
+SELECT app.enable_tenant_rls('reservation_nights');
+SELECT app.enable_tenant_rls('holds');
+SELECT app.enable_tenant_rls('stays');
+SELECT app.enable_tenant_rls('room_moves');
+SELECT app.enable_tenant_rls('business_dates');
+SELECT app.enable_tenant_rls('night_audits');
+SELECT app.enable_tenant_rls('night_audit_steps');
+SELECT app.enable_tenant_rls('kpi_snapshots');
 ```
 
-### 6.3 Booking algorithm (normative)
-1. Resolve rate plan + restrictions for each night; reject on violation with `RESTRICTION_VIOLATED`.
-2. In one transaction: `UPDATE room_type_inventory SET sold = sold + :n WHERE … AND stay_date IN range AND NOT stop_sell` → expect row count = nights (else `NO_INVENTORY`).
-3. If a specific unit is requested/assigned, insert `reservation_units` — a `23P01` exclusion violation → `409 ROOM_NOT_AVAILABLE`.
-4. Insert reservation, nights, deposit schedule, outbox event.
-5. Cancel/no-show/modify: reverse the inventory counters in the same transaction.
-6. Endpoint requires `Idempotency-Key`.
+---
 
-### 6.4 Night audit (REQ-RSV-013)
-Steps (each checkpointed, resumable, idempotent): (1) pre-audit checks: arrivals not checked-in (mark no-show per policy), departures not checked-out, open POS bills; (2) post room charge + tax (+ service charge) per in-house stay; (3) post no-show & cancellation fees; (4) post recurring rent; (5) roll `branch.business_date`; (6) generate accounting vouchers per posting rules; (7) snapshot KPIs (occupancy, ADR, RevPAR); (8) produce audit report pack. Failure leaves business date unchanged and raises an alert.
+## 9. Folio, Billing & Payments
 
-### 6.5 Folio
+### 9.1 Requirements
+| ID | Requirement |
+|---|---|
+| REQ-FOL-001 | Folio multi-window split billing (Window 1: Company / Room & Tax, Window 2: Personal Incidentals). |
+| REQ-FOL-002 | Folio optimistic concurrency locking via `version int NOT NULL DEFAULT 1` and `SELECT ... FOR UPDATE`. |
+| REQ-FOL-003 | Strict folio state machine: `open ➔ settled ➔ closed`. Closed folios reject postings. |
+| REQ-FOL-004 | Night audit idempotency constraint: unique `(tenant_id, branch_id, stay_id, business_date, charge_type)`. |
+| REQ-FOL-005 | PCI DSS v4.0.1 tokenized payments architecture with zero storage of raw PAN or CVV/CVC data. |
+
+### 9.2 Folio & Payments Production DDL
 
 ```sql
 CREATE TABLE folios (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL,
-  folio_no text NOT NULL, kind text NOT NULL CHECK (kind IN ('guest','master','city_ledger','incidental')),
-  reservation_id uuid, company_id uuid, status text NOT NULL CHECK (status IN ('open','settled','closed')),
-  currency char(3) NOT NULL, UNIQUE (branch_id, folio_no)
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  folio_no text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('guest','master','city_ledger','incidental')),
+  stay_id uuid REFERENCES stays(id),
+  reservation_id uuid REFERENCES reservations(id),
+  company_id uuid REFERENCES companies(id),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','settled','closed')),
+  currency char(3) NOT NULL,
+  total_charges numeric(19,4) NOT NULL DEFAULT 0.0000,
+  total_payments numeric(19,4) NOT NULL DEFAULT 0.0000,
+  balance numeric(19,4) NOT NULL DEFAULT 0.0000,
+  version int NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, branch_id, folio_no)
 );
+CREATE INDEX folios_tenant_stay_idx ON folios (tenant_id, stay_id);
 
-CREATE TABLE folio_lines (                       -- append-only
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL,
-  folio_id uuid NOT NULL REFERENCES folios, window_no int DEFAULT 1,   -- split billing windows
-  business_date date NOT NULL, line_type text NOT NULL CHECK (line_type IN ('charge','payment','adjustment','transfer')),
-  charge_code_id uuid, description text NOT NULL,
-  qty numeric(12,3) DEFAULT 1, unit_amount numeric(19,4) NOT NULL,
-  amount numeric(19,4) NOT NULL,                -- signed: charges +, payments −
-  tax_amount numeric(19,4) DEFAULT 0, tax_snapshot jsonb,
-  source_type text, source_id uuid,             -- 'restaurant_bill', 'night_audit', 'manual'
-  reverses_line_id uuid REFERENCES folio_lines, voucher_id uuid,
-  created_at timestamptz DEFAULT now(), created_by uuid
+CREATE TABLE folio_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  folio_id uuid NOT NULL REFERENCES folios(id) ON DELETE RESTRICT,
+  stay_id uuid REFERENCES stays(id),
+  window_no int NOT NULL DEFAULT 1,
+  business_date date NOT NULL,
+  line_type text NOT NULL CHECK (line_type IN ('charge','payment','adjustment','transfer')),
+  charge_type text NOT NULL DEFAULT 'manual', -- 'room','tax','service','fnb','laundry','payment'
+  charge_code_id uuid REFERENCES charge_codes(id),
+  description text NOT NULL,
+  qty numeric(12,3) NOT NULL DEFAULT 1,
+  unit_amount numeric(19,4) NOT NULL,
+  amount numeric(19,4) NOT NULL, -- Charges +, Payments -
+  tax_amount numeric(19,4) NOT NULL DEFAULT 0.0000,
+  tax_snapshot jsonb NOT NULL DEFAULT '[]',
+  source_type text NOT NULL DEFAULT 'manual', -- 'night_audit','restaurant_bill','terminal','front_desk'
+  source_id uuid,
+  reverses_line_id uuid REFERENCES folio_lines(id),
+  voucher_id uuid,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by uuid
 );
+CREATE INDEX folio_lines_tenant_folio_idx ON folio_lines (tenant_id, folio_id, window_no);
+-- Night audit idempotency index
+CREATE UNIQUE INDEX folio_lines_audit_idempotency_idx ON folio_lines (tenant_id, branch_id, stay_id, business_date, charge_type)
+  WHERE charge_type IN ('room','night_tax');
+
+CREATE TABLE payment_intents (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  gateway_name text NOT NULL, -- 'stripe','adyen'
+  gateway_intent_id text NOT NULL,
+  amount numeric(19,4) NOT NULL,
+  currency char(3) NOT NULL,
+  status text NOT NULL CHECK (status IN ('requires_payment_method','requires_confirmation','requires_capture','succeeded','cancelled')),
+  payment_method_token text,
+  terminal_id text,
+  last_four char(4),
+  card_brand text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, gateway_name, gateway_intent_id)
+);
+CREATE INDEX payment_intents_tenant_idx ON payment_intents (tenant_id, gateway_name, gateway_intent_id);
+
+CREATE TABLE payments (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  folio_id uuid NOT NULL REFERENCES folios(id),
+  payment_intent_id uuid REFERENCES payment_intents(id),
+  payment_method text NOT NULL CHECK (payment_method IN ('cash','card_present','card_online','qr_code','city_ledger','voucher')),
+  amount numeric(19,4) NOT NULL,
+  currency char(3) NOT NULL,
+  reference_no text,
+  tendered_amount numeric(19,4),
+  change_amount numeric(19,4) NOT NULL DEFAULT 0.0000,
+  captured_at timestamptz NOT NULL DEFAULT now(),
+  captured_by uuid NOT NULL,
+  voucher_id uuid
+);
+CREATE INDEX payments_tenant_folio_idx ON payments (tenant_id, folio_id);
+
+SELECT app.enable_tenant_rls('folios');
+SELECT app.enable_tenant_rls('folio_lines');
+SELECT app.enable_tenant_rls('payment_intents');
+SELECT app.enable_tenant_rls('payments');
 ```
-Rules: no UPDATE/DELETE (trigger); corrections via reversing line (requires `folio.charge.void` + reason); transfers create a pair of lines; closed folios reject new lines; checkout with balance ≠ 0 requires payment or city-ledger transfer.
-
-### 6.6 Housekeeping & maintenance
-- Tasks generated from status events (check-out → clean, stay-over service, inspection), assignable, with checklist, timer, photo, supply consumption (→ inventory issue).
-- Attendant mobile view: my rooms, start/finish, report issue → maintenance order, lost & found.
-- Maintenance orders can block a unit (OOO/OOS) with date range.
 
 ---
 
-## 7. Restaurant / F&B
+## 10. Housekeeping & Maintenance
 
+### 10.1 Requirements
 | ID | Requirement |
 |---|---|
-| REQ-FNB-001 | Multiple outlets per branch (restaurant, bar, room service, banquet) each with tables/layout, menus, hours, tax/service charge setup. |
-| REQ-FNB-002 | Menu: categories, items, variants/sizes, modifiers, combos, time-based pricing (happy hour), availability toggle (86'd), course assignment, kitchen station routing. |
-| REQ-FNB-003 | Table board uses the same tile pattern as rooms (status: free, seated, ordered, served, bill-printed, dirty, reserved). |
-| REQ-FNB-004 | Orders: open/hold, add/void items (permission + reason), course firing, notes, seat/guest count, transfer/merge/split table and bill. |
-| REQ-FNB-005 | KOT/KDS: tickets per station with timers, bump, reprint; void after fire creates a **void KOT**. |
-| REQ-FNB-006 | Billing: discounts (limits), service charge, taxes, tips, split by item/seat/amount, multiple tenders (cash, card, QR, **room charge**, city ledger, voucher/coupon). |
-| REQ-FNB-007 | Room charge MUST validate in-house guest (room + name) and post a folio line on settle. |
-| REQ-FNB-008 | Recipes (BOM): each menu item links to a recipe (ingredients, qty, yield/waste %) used for theoretical cost and stock depletion. |
-| REQ-FNB-009 | Depletion mode configurable: at KOT fire or at bill settle; voids/waste handled symmetrically. |
-| REQ-FNB-010 | Shift/cash management: open/close shift, cash drop, X/Z reports, variance posting to voucher. |
-| REQ-FNB-011 | Reports: sales by item/category/hour/waiter, void & discount audit, food cost % (theoretical vs actual), menu engineering. |
-| REQ-FNB-012 | Offline tolerance (SHOULD): order entry queues locally for short outages and syncs idempotently. |
+| REQ-HKP-001 | Automated cleaning task creation on checkout, room move, or stay-over cycle. |
+| REQ-HKP-002 | Mobile attendant task execution with digital cleaning checklists and timers. |
+| REQ-HKP-003 | Maintenance work orders linked to Out-of-Order (OOO) and Out-of-Service (OOS) unit blocks. |
+| REQ-HKP-004 | Lost & Found custody registry with photo attachments and claim resolution workflow. |
 
-Key tables: `outlets, tables, menu_categories, menu_items, menu_item_prices, modifier_groups, modifiers, orders, order_lines, kots, kot_lines, bills, bill_lines, bill_payments, shifts, recipes, recipe_lines`.
-
----
-
-## 8. Inventory
-
-| ID | Requirement |
-|---|---|
-| REQ-INV-001 | Item master: code, name, category, base UoM, purchase/issue UoMs with conversions, tracking (none/batch/serial/expiry), reorder level/qty, preferred supplier, GL accounts (inventory, COGS, adjustment), custom fields. |
-| REQ-INV-002 | Warehouses/locations per branch (main store, kitchen, bar, housekeeping, minibar); inter-location transfers; inter-branch transfers via in-transit. |
-| REQ-INV-003 | Documents: Purchase Request → Purchase Order → **GRN** (goods receipt) → Supplier invoice (AP voucher); Issue/Requisition; Transfer; Adjustment; Waste/Spoilage; Stock Count (cycle & full). |
-| REQ-INV-004 | Every stock change MUST create `stock_ledger` rows (append-only) with qty delta, unit cost, value delta, running qty/value, valuation rate. |
-| REQ-INV-005 | Valuation: **WAC by default** (`new_rate = (old_value + in_value) / (old_qty + in_qty)`); FIFO layers optional per category; method fixed after first movement. |
-| REQ-INV-006 | Negative stock policy configurable per warehouse (block / warn / allow). |
-| REQ-INV-007 | Concurrent movements for the same item+warehouse MUST be serialised via row lock on `stock_balances`. |
-| REQ-INV-008 | Stock count: freeze/snapshot, count entry (mobile/barcode), variance → adjustment document with approval → voucher. |
-| REQ-INV-009 | Reorder alerts and suggested PO; expiry alerts. |
-| REQ-INV-010 | Reports: stock on hand, valuation (reconciles to GL inventory account), movement/ledger, ageing, usage vs theoretical, supplier price history. |
+### 10.2 Housekeeping & Maintenance Production DDL
 
 ```sql
-CREATE TABLE stock_ledger (                      -- append-only
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL,
-  item_id uuid NOT NULL, warehouse_id uuid NOT NULL, posting_date date NOT NULL, posted_at timestamptz DEFAULT now(),
-  doc_type text NOT NULL, doc_id uuid NOT NULL, doc_line_id uuid,
-  qty_delta numeric(18,4) NOT NULL, unit_cost numeric(19,6) NOT NULL, value_delta numeric(19,4) NOT NULL,
-  balance_qty numeric(18,4) NOT NULL, balance_value numeric(19,4) NOT NULL, valuation_rate numeric(19,6) NOT NULL,
-  batch_no text, serial_no text, voucher_id uuid
+CREATE TABLE hk_tasks (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  unit_id uuid NOT NULL REFERENCES units(id),
+  task_type text NOT NULL CHECK (task_type IN ('checkout_clean','stayover_clean','deep_clean','turndown','inspection')),
+  priority text NOT NULL DEFAULT 'standard' CHECK (priority IN ('low','standard','high','urgent')),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','in_progress','completed','inspected','rejected')),
+  assigned_to uuid REFERENCES users(id),
+  checklist_id uuid,
+  started_at timestamptz,
+  finished_at timestamptz,
+  notes text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz
 );
-CREATE TABLE stock_balances (
-  tenant_id uuid NOT NULL, item_id uuid NOT NULL, warehouse_id uuid NOT NULL,
-  qty numeric(18,4) NOT NULL DEFAULT 0, value numeric(19,4) NOT NULL DEFAULT 0,
-  valuation_rate numeric(19,6) NOT NULL DEFAULT 0, PRIMARY KEY (item_id, warehouse_id)
+CREATE INDEX hk_tasks_tenant_branch_idx ON hk_tasks (tenant_id, branch_id, status, assigned_to);
+
+CREATE TABLE hk_checklists (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  task_type text NOT NULL,
+  items jsonb NOT NULL DEFAULT '[]', -- [{"id":"1","label":"Change linens","mandatory":true}]
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, code)
 );
+CREATE INDEX hk_checklists_tenant_idx ON hk_checklists (tenant_id, task_type);
+
+CREATE TABLE maintenance_orders (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  unit_id uuid REFERENCES units(id),
+  area_description text,
+  title text NOT NULL,
+  description text NOT NULL,
+  priority text NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','emergency')),
+  status text NOT NULL DEFAULT 'reported' CHECK (status IN ('reported','assigned','in_progress','completed','cancelled')),
+  assigned_to uuid REFERENCES users(id),
+  blocks_unit boolean NOT NULL DEFAULT false,
+  block_type text CHECK (block_type IN ('out_of_order','out_of_service')),
+  reported_by uuid NOT NULL,
+  resolved_at timestamptz,
+  resolution_notes text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz
+);
+CREATE INDEX maintenance_orders_tenant_idx ON maintenance_orders (tenant_id, branch_id, status);
+
+CREATE TABLE lost_found (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  item_name text NOT NULL,
+  category text NOT NULL CHECK (category IN ('clothing','electronics','jewelry','document','cash','other')),
+  found_location text NOT NULL,
+  found_unit_id uuid REFERENCES units(id),
+  found_by uuid NOT NULL,
+  found_date date NOT NULL,
+  status text NOT NULL DEFAULT 'held' CHECK (status IN ('held','claimed','disposed','auctioned')),
+  claimed_by_guest_id uuid REFERENCES guests(id),
+  claimed_at timestamptz,
+  storage_location text NOT NULL,
+  photo_url text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX lost_found_tenant_idx ON lost_found (tenant_id, branch_id, status);
+
+SELECT app.enable_tenant_rls('hk_tasks');
+SELECT app.enable_tenant_rls('hk_checklists');
+SELECT app.enable_tenant_rls('maintenance_orders');
+SELECT app.enable_tenant_rls('lost_found');
 ```
 
 ---
 
-## 9. Accounting with Vouchering
+## 11. Restaurant / F&B POS
 
-### 9.1 Requirements
-
+### 11.1 Requirements
 | ID | Requirement |
 |---|---|
-| REQ-ACC-001 | Double-entry only; a voucher MUST have ≥ 2 lines and Σdebit = Σcredit (in base currency) before posting. |
-| REQ-ACC-002 | **Chart of accounts**: hierarchical, typed (asset, liability, equity, income, expense), control-account flag, currency, branch-restrictable; seed templates (hotel, restaurant, rental). |
-| REQ-ACC-003 | **Voucher types** (configurable names/prefixes): Journal (JV), Receipt (RV), Payment (PV), Contra (CV), Sales/Invoice (SV), Purchase/Bill (PB), Debit Note, Credit Note, Opening Balance, Stock Journal, Auto-posting (system). |
-| REQ-ACC-004 | Voucher lifecycle: `draft → submitted → approved → posted`; `cancelled` only for non-posted; posted vouchers are corrected by **reversal voucher** (`reversal_of`). |
-| REQ-ACC-005 | Approval workflow configurable per voucher type/amount/branch (e.g. PV > X needs Finance Manager); segregation of duties. |
-| REQ-ACC-006 | **Gapless numbering** per (voucher type, branch, fiscal year) assigned at posting under row lock; drafts carry a temporary reference. |
-| REQ-ACC-007 | Posting writes **immutable `gl_entries`**; UPDATE/DELETE blocked by trigger. |
-| REQ-ACC-008 | Fiscal years and periods (open/soft-closed/closed); posting into a closed period is rejected; back-dating limited by role limit. |
-| REQ-ACC-009 | Each line supports: account, debit/credit, party (guest/company/supplier), cost centre, dimensions (department, outlet, project), narration, tax code, currency + FX rate. |
-| REQ-ACC-010 | Multi-currency: transaction amount, rate, base amount; realised/unrealised FX gain-loss vouchers. |
-| REQ-ACC-011 | **Auto-posting** from operational modules through configurable `posting_rules` (see §9.3) inside the same DB transaction as the source document. |
-| REQ-ACC-012 | Attachments (receipts, invoices) on vouchers; print/PDF templates per type. |
-| REQ-ACC-013 | Sub-ledgers: Guest ledger & City ledger (AR), Accounts payable, Cash/Bank, Inventory; reconciliation views to control accounts. |
-| REQ-ACC-014 | Bank reconciliation (import statements, match, create adjustment vouchers). |
-| REQ-ACC-015 | Reports: Trial balance, General ledger, Account statement, Day book, Cash book, Bank book, AR/AP ageing, P&L, Balance sheet, Cash flow, Departmental P&L (rooms, F&B), Tax reports; all drillable to voucher → source document. |
-| REQ-ACC-016 | Year-end closing generates closing entry to retained earnings; opening balances carried forward. |
-| REQ-ACC-017 | Recurring vouchers (rent, depreciation placeholders) and voucher templates. |
-| REQ-ACC-018 | Branch-level and consolidated reporting; inter-branch due-to/due-from. |
+| REQ-FNB-001 | Multi-outlet food and beverage management with interactive table boards. |
+| REQ-FNB-002 | Kitchen Order Ticket (KOT) routing by station (Grill, Bar, Pastry). |
+| REQ-FNB-003 | Bill settlement with atomic Room Charge validation (room number + guest name match). |
+| REQ-FNB-004 | Automated inventory depletion based on Bill of Materials (BOM) recipes evaluated at Weighted Average Cost (WAC). |
+| REQ-FNB-005 | POS cashier shift management, float tracking, X/Z readings, and cash over/short voucher creation. |
 
-### 9.2 Core tables
+### 11.2 Restaurant & POS Production DDL
 
 ```sql
-CREATE TABLE coa_accounts (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, code text NOT NULL, name text NOT NULL,
-  parent_id uuid REFERENCES coa_accounts, type text NOT NULL CHECK (type IN ('asset','liability','equity','income','expense')),
-  normal_side char(1) NOT NULL CHECK (normal_side IN ('D','C')),
-  is_group boolean DEFAULT false, is_control boolean DEFAULT false, party_type text,
-  currency char(3), allowed_branch_ids uuid[], active boolean DEFAULT true,
+CREATE TABLE outlets (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  kind text NOT NULL DEFAULT 'restaurant' CHECK (kind IN ('restaurant','bar','cafe','room_service','banquet')),
+  warehouse_id uuid, -- Default warehouse for raw ingredient depletion
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, branch_id, code)
+);
+CREATE INDEX outlets_tenant_idx ON outlets (tenant_id, branch_id);
+
+CREATE TABLE tables (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  outlet_id uuid NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  number text NOT NULL,
+  name text,
+  capacity int NOT NULL DEFAULT 4,
+  status text NOT NULL DEFAULT 'free' CHECK (status IN ('free','seated','ordered','served','bill_printed','dirty')),
+  status_changed_at timestamptz NOT NULL DEFAULT now(),
+  pos_x int NOT NULL DEFAULT 0,
+  pos_y int NOT NULL DEFAULT 0,
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, outlet_id, number)
+);
+CREATE INDEX tables_tenant_outlet_idx ON tables (tenant_id, outlet_id, status);
+
+CREATE TABLE menu_categories (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  outlet_id uuid NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  sort int NOT NULL DEFAULT 0,
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, outlet_id, name)
+);
+CREATE INDEX menu_categories_tenant_idx ON menu_categories (tenant_id, outlet_id, sort);
+
+CREATE TABLE menu_items (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  outlet_id uuid NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  category_id uuid NOT NULL REFERENCES menu_categories(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  description text,
+  kitchen_station text NOT NULL DEFAULT 'main' CHECK (kitchen_station IN ('main','grill','bar','pastry','salad')),
+  is_86 boolean NOT NULL DEFAULT false, -- Out of stock toggle
+  tax_rule_id uuid REFERENCES tax_rules(id),
+  charge_code_id uuid REFERENCES charge_codes(id),
+  sort int NOT NULL DEFAULT 0,
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, outlet_id, code)
+);
+CREATE INDEX menu_items_tenant_idx ON menu_items (tenant_id, outlet_id, category_id);
+
+CREATE TABLE menu_item_prices (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  menu_item_id uuid NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
+  variant_name text NOT NULL DEFAULT 'standard', -- 'regular','large','pitcher'
+  price numeric(19,4) NOT NULL,
+  UNIQUE (tenant_id, menu_item_id, variant_name)
+);
+CREATE INDEX menu_item_prices_tenant_idx ON menu_item_prices (tenant_id, menu_item_id);
+
+CREATE TABLE modifier_groups (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  outlet_id uuid NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  min_selections int NOT NULL DEFAULT 0,
+  max_selections int NOT NULL DEFAULT 1,
+  UNIQUE (tenant_id, outlet_id, name)
+);
+
+CREATE TABLE modifiers (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  group_id uuid NOT NULL REFERENCES modifier_groups(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  price_delta numeric(19,4) NOT NULL DEFAULT 0.0000,
+  UNIQUE (tenant_id, group_id, name)
+);
+
+CREATE TABLE shifts (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  outlet_id uuid NOT NULL REFERENCES outlets(id),
+  cashier_id uuid NOT NULL REFERENCES users(id),
+  starting_float numeric(19,4) NOT NULL,
+  closing_cash numeric(19,4),
+  expected_cash numeric(19,4),
+  cash_variance numeric(19,4),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+  opened_at timestamptz NOT NULL DEFAULT now(),
+  closed_at timestamptz,
+  z_reading_no text
+);
+CREATE INDEX shifts_tenant_outlet_idx ON shifts (tenant_id, outlet_id, status);
+
+CREATE TABLE orders (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  outlet_id uuid NOT NULL REFERENCES outlets(id),
+  table_id uuid REFERENCES tables(id),
+  shift_id uuid REFERENCES shifts(id),
+  order_no text NOT NULL,
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','fired','served','billed','settled','voided')),
+  covers int NOT NULL DEFAULT 1,
+  waiter_id uuid NOT NULL REFERENCES users(id),
+  notes text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, branch_id, order_no)
+);
+CREATE INDEX orders_tenant_status_idx ON orders (tenant_id, outlet_id, status);
+
+CREATE TABLE order_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  order_id uuid NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  menu_item_id uuid NOT NULL REFERENCES menu_items(id),
+  variant_name text NOT NULL DEFAULT 'standard',
+  qty numeric(12,3) NOT NULL DEFAULT 1,
+  unit_price numeric(19,4) NOT NULL,
+  total_price numeric(19,4) NOT NULL,
+  selected_modifiers jsonb NOT NULL DEFAULT '[]',
+  status text NOT NULL DEFAULT 'held' CHECK (status IN ('held','fired','served','voided')),
+  void_reason text,
+  void_by uuid,
+  course int NOT NULL DEFAULT 1,
+  seat_no int,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX order_lines_tenant_idx ON order_lines (tenant_id, order_id);
+
+CREATE TABLE kots (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  order_id uuid NOT NULL REFERENCES orders(id),
+  kot_no text NOT NULL,
+  kitchen_station text NOT NULL,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','bumped','voided')),
+  fired_at timestamptz NOT NULL DEFAULT now(),
+  bumped_at timestamptz,
+  UNIQUE (tenant_id, branch_id, kot_no)
+);
+CREATE INDEX kots_tenant_station_idx ON kots (tenant_id, kitchen_station, status);
+
+CREATE TABLE kot_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  kot_id uuid NOT NULL REFERENCES kots(id) ON DELETE CASCADE,
+  order_line_id uuid NOT NULL REFERENCES order_lines(id),
+  qty numeric(12,3) NOT NULL,
+  item_name text NOT NULL,
+  notes text
+);
+
+CREATE TABLE bills (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  order_id uuid NOT NULL REFERENCES orders(id),
+  bill_no text NOT NULL,
+  subtotal numeric(19,4) NOT NULL,
+  discount_amount numeric(19,4) NOT NULL DEFAULT 0.0000,
+  tax_amount numeric(19,4) NOT NULL DEFAULT 0.0000,
+  service_charge numeric(19,4) NOT NULL DEFAULT 0.0000,
+  grand_total numeric(19,4) NOT NULL,
+  status text NOT NULL DEFAULT 'unpaid' CHECK (status IN ('unpaid','settled','voided')),
+  settled_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, bill_no)
+);
+CREATE INDEX bills_tenant_order_idx ON bills (tenant_id, order_id);
+
+CREATE TABLE bill_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  bill_id uuid NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+  order_line_id uuid NOT NULL REFERENCES order_lines(id),
+  description text NOT NULL,
+  qty numeric(12,3) NOT NULL,
+  unit_price numeric(19,4) NOT NULL,
+  amount numeric(19,4) NOT NULL
+);
+
+CREATE TABLE bill_payments (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  bill_id uuid NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+  payment_method text NOT NULL CHECK (payment_method IN ('cash','card','qr','room_charge','city_ledger')),
+  amount numeric(19,4) NOT NULL,
+  room_stay_id uuid REFERENCES stays(id),
+  folio_line_id uuid REFERENCES folio_lines(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX bill_payments_tenant_bill_idx ON bill_payments (tenant_id, bill_id);
+
+SELECT app.enable_tenant_rls('outlets');
+SELECT app.enable_tenant_rls('tables');
+SELECT app.enable_tenant_rls('menu_categories');
+SELECT app.enable_tenant_rls('menu_items');
+SELECT app.enable_tenant_rls('menu_item_prices');
+SELECT app.enable_tenant_rls('modifier_groups');
+SELECT app.enable_tenant_rls('modifiers');
+SELECT app.enable_tenant_rls('shifts');
+SELECT app.enable_tenant_rls('orders');
+SELECT app.enable_tenant_rls('order_lines');
+SELECT app.enable_tenant_rls('kots');
+SELECT app.enable_tenant_rls('kot_lines');
+SELECT app.enable_tenant_rls('bills');
+SELECT app.enable_tenant_rls('bill_lines');
+SELECT app.enable_tenant_rls('bill_payments');
+```
+
+---
+
+## 12. Inventory & Purchasing
+
+### 12.1 Requirements
+| ID | Requirement |
+|---|---|
+| REQ-INV-001 | Item master catalog with base and conversion Units of Measure (UoM). |
+| REQ-INV-002 | Complete procurement lifecycle: Purchase Order (PO) ➔ Goods Receipt Note (GRN) ➔ Supplier Bill. |
+| REQ-INV-003 | Append-only `stock_ledger` recording physical and financial stock movements. |
+| REQ-INV-004 | Concurrency control via `SELECT ... FOR UPDATE` row locks on `stock_balances(tenant_id, warehouse_id, item_id)`. |
+| REQ-INV-005 | Weighted Average Cost (WAC) valuation engine with FIFO layer tracking support. |
+| REQ-INV-006 | Recipe Bills of Materials (BOM) with yield and waste percentages. |
+
+### 12.2 Inventory & Purchasing Production DDL
+
+```sql
+CREATE TABLE uoms (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
   UNIQUE (tenant_id, code)
 );
 
-CREATE TABLE fiscal_periods (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, fiscal_year int NOT NULL, period_no int NOT NULL,
-  start_date date NOT NULL, end_date date NOT NULL,
-  status text NOT NULL CHECK (status IN ('open','soft_closed','closed')),
-  UNIQUE (tenant_id, fiscal_year, period_no)
+CREATE TABLE uom_conversions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  from_uom_id uuid NOT NULL REFERENCES uoms(id),
+  to_uom_id uuid NOT NULL REFERENCES uoms(id),
+  conversion_factor numeric(18,8) NOT NULL,
+  UNIQUE (tenant_id, from_uom_id, to_uom_id)
 );
 
-CREATE TABLE voucher_types (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, code text NOT NULL, name text NOT NULL,
-  prefix text NOT NULL, reset_policy text NOT NULL DEFAULT 'yearly',
-  requires_approval boolean DEFAULT false, approval_rules jsonb DEFAULT '[]',
-  is_system boolean DEFAULT false, print_template text, UNIQUE (tenant_id, code)
+CREATE TABLE warehouses (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  negative_stock_policy text NOT NULL DEFAULT 'block' CHECK (negative_stock_policy IN ('block','warn','allow')),
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, branch_id, code)
+);
+CREATE INDEX warehouses_tenant_idx ON warehouses (tenant_id, branch_id);
+
+CREATE TABLE items (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  category text NOT NULL, -- 'food_beverage','housekeeping_supplies','linen','maintenance','operating_asset'
+  base_uom_id uuid NOT NULL REFERENCES uoms(id),
+  purchase_uom_id uuid REFERENCES uoms(id),
+  reorder_level numeric(18,4) NOT NULL DEFAULT 0.0000,
+  reorder_qty numeric(18,4) NOT NULL DEFAULT 0.0000,
+  valuation_method text NOT NULL DEFAULT 'wac' CHECK (valuation_method IN ('wac','fifo')),
+  gl_inventory_account text NOT NULL,
+  gl_cogs_account text NOT NULL,
+  gl_adjustment_account text NOT NULL,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz,
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX items_tenant_category_idx ON items (tenant_id, category);
+
+CREATE TABLE suppliers (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  tax_identifier text,
+  payment_terms_days int NOT NULL DEFAULT 30,
+  contact_email text,
+  phone text,
+  address jsonb NOT NULL DEFAULT '{}',
+  is_active boolean NOT NULL DEFAULT true,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX suppliers_tenant_idx ON suppliers (tenant_id, name);
+
+CREATE TABLE purchase_orders (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  supplier_id uuid NOT NULL REFERENCES suppliers(id),
+  po_no text NOT NULL,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','approved','issued','partially_received','completed','cancelled')),
+  issue_date date NOT NULL,
+  expected_delivery_date date,
+  total_amount numeric(19,4) NOT NULL DEFAULT 0.0000,
+  created_by uuid NOT NULL,
+  approved_by uuid,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, po_no)
+);
+CREATE INDEX purchase_orders_tenant_idx ON purchase_orders (tenant_id, branch_id, status);
+
+CREATE TABLE po_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  po_id uuid NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  item_id uuid NOT NULL REFERENCES items(id),
+  qty numeric(18,4) NOT NULL,
+  unit_price numeric(19,4) NOT NULL,
+  line_total numeric(19,4) NOT NULL,
+  received_qty numeric(18,4) NOT NULL DEFAULT 0.0000
 );
 
-CREATE TABLE vouchers (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL,
-  voucher_type_id uuid NOT NULL REFERENCES voucher_types,
-  voucher_no text,                               -- assigned at post
-  draft_ref text NOT NULL, voucher_date date NOT NULL,
-  status text NOT NULL CHECK (status IN ('draft','submitted','approved','posted','cancelled')),
-  currency char(3) NOT NULL, fx_rate numeric(18,8) NOT NULL DEFAULT 1,
-  narration text, source_type text, source_id uuid,    -- link to folio/bill/GRN…
-  reversal_of uuid REFERENCES vouchers, reversed_by uuid REFERENCES vouchers,
-  total_debit numeric(19,4) NOT NULL DEFAULT 0, total_credit numeric(19,4) NOT NULL DEFAULT 0,
-  attrs jsonb DEFAULT '{}', version int DEFAULT 1,
-  created_by uuid NOT NULL, approved_by uuid, posted_by uuid, posted_at timestamptz,
-  UNIQUE (tenant_id, branch_id, voucher_type_id, voucher_no)
+CREATE TABLE grn (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  supplier_id uuid NOT NULL REFERENCES suppliers(id),
+  po_id uuid REFERENCES purchase_orders(id),
+  grn_no text NOT NULL,
+  received_date date NOT NULL,
+  supplier_invoice_no text,
+  total_received_value numeric(19,4) NOT NULL,
+  status text NOT NULL DEFAULT 'posted' CHECK (status IN ('draft','posted','cancelled')),
+  voucher_id uuid,
+  received_by uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, grn_no)
+);
+CREATE INDEX grn_tenant_idx ON grn (tenant_id, branch_id, received_date);
+
+CREATE TABLE grn_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  grn_id uuid NOT NULL REFERENCES grn(id) ON DELETE CASCADE,
+  item_id uuid NOT NULL REFERENCES items(id),
+  received_qty numeric(18,4) NOT NULL,
+  unit_cost numeric(19,6) NOT NULL,
+  total_cost numeric(19,4) NOT NULL
 );
 
-CREATE TABLE voucher_lines (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, voucher_id uuid NOT NULL REFERENCES vouchers ON DELETE CASCADE,
-  line_no int NOT NULL, account_id uuid NOT NULL REFERENCES coa_accounts,
-  debit numeric(19,4) NOT NULL DEFAULT 0 CHECK (debit >= 0), credit numeric(19,4) NOT NULL DEFAULT 0 CHECK (credit >= 0),
-  CHECK ((debit = 0) <> (credit = 0)),
-  party_type text, party_id uuid, cost_center_id uuid, dimensions jsonb DEFAULT '{}', tax_code text, narration text
+CREATE TABLE stock_ledger (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  item_id uuid NOT NULL REFERENCES items(id),
+  posting_date date NOT NULL,
+  posted_at timestamptz NOT NULL DEFAULT now(),
+  doc_type text NOT NULL, -- 'grn','issue','transfer_in','transfer_out','adjustment','waste','pos_depletion'
+  doc_id uuid NOT NULL,
+  doc_line_id uuid,
+  qty_delta numeric(18,4) NOT NULL,
+  unit_cost numeric(19,6) NOT NULL,
+  value_delta numeric(19,4) NOT NULL,
+  balance_qty numeric(18,4) NOT NULL,
+  balance_value numeric(19,4) NOT NULL,
+  valuation_rate numeric(19,6) NOT NULL,
+  voucher_id uuid
+);
+CREATE INDEX stock_ledger_tenant_item_idx ON stock_ledger (tenant_id, warehouse_id, item_id, posting_date DESC);
+
+CREATE TABLE stock_balances (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  item_id uuid NOT NULL REFERENCES items(id),
+  qty numeric(18,4) NOT NULL DEFAULT 0.0000,
+  value numeric(19,4) NOT NULL DEFAULT 0.0000,
+  valuation_rate numeric(19,6) NOT NULL DEFAULT 0.000000,
+  PRIMARY KEY (tenant_id, warehouse_id, item_id)
+);
+CREATE INDEX stock_balances_tenant_idx ON stock_balances (tenant_id, warehouse_id);
+
+CREATE TABLE stock_counts (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  count_no text NOT NULL,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','in_progress','submitted','approved','reconciled')),
+  freeze_snapshot timestamptz NOT NULL DEFAULT now(),
+  counted_by uuid NOT NULL,
+  approved_by uuid,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, count_no)
 );
 
-CREATE TABLE gl_entries (                        -- append-only ledger
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid NOT NULL,
-  voucher_id uuid NOT NULL, voucher_line_id uuid NOT NULL, voucher_no text NOT NULL,
-  posting_date date NOT NULL, fiscal_period_id uuid NOT NULL,
-  account_id uuid NOT NULL, debit numeric(19,4) NOT NULL, credit numeric(19,4) NOT NULL,
-  party_type text, party_id uuid, cost_center_id uuid, dimensions jsonb, currency char(3), txn_amount numeric(19,4),
-  posted_at timestamptz DEFAULT now()
+CREATE TABLE stock_count_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  stock_count_id uuid NOT NULL REFERENCES stock_counts(id) ON DELETE CASCADE,
+  item_id uuid NOT NULL REFERENCES items(id),
+  system_qty numeric(18,4) NOT NULL,
+  counted_qty numeric(18,4),
+  variance_qty numeric(18,4),
+  unit_cost numeric(19,6) NOT NULL,
+  variance_value numeric(19,4)
 );
-CREATE INDEX gl_acct_date ON gl_entries (tenant_id, account_id, posting_date);
+
+CREATE TABLE stock_adjustments (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  adjustment_no text NOT NULL,
+  reason text NOT NULL,
+  item_id uuid NOT NULL REFERENCES items(id),
+  qty_delta numeric(18,4) NOT NULL,
+  unit_cost numeric(19,6) NOT NULL,
+  value_delta numeric(19,4) NOT NULL,
+  voucher_id uuid,
+  approved_by uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, adjustment_no)
+);
+
+CREATE TABLE stock_transfers (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  from_branch_id uuid NOT NULL REFERENCES branches(id),
+  from_warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  to_branch_id uuid NOT NULL REFERENCES branches(id),
+  to_warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  transfer_no text NOT NULL,
+  status text NOT NULL DEFAULT 'in_transit' CHECK (status IN ('in_transit','received','cancelled')),
+  item_id uuid NOT NULL REFERENCES items(id),
+  qty numeric(18,4) NOT NULL,
+  unit_cost numeric(19,6) NOT NULL,
+  total_value numeric(19,4) NOT NULL,
+  shipped_at timestamptz NOT NULL DEFAULT now(),
+  received_at timestamptz,
+  UNIQUE (tenant_id, transfer_no)
+);
+
+CREATE TABLE recipes (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  menu_item_id uuid NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
+  variant_name text NOT NULL DEFAULT 'standard',
+  yield_pct numeric(5,2) NOT NULL DEFAULT 100.00,
+  theoretical_cost numeric(19,4) NOT NULL DEFAULT 0.0000,
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, menu_item_id, variant_name)
+);
+
+CREATE TABLE recipe_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  recipe_id uuid NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+  ingredient_item_id uuid NOT NULL REFERENCES items(id),
+  qty numeric(18,4) NOT NULL,
+  uom_id uuid NOT NULL REFERENCES uoms(id),
+  waste_pct numeric(5,2) NOT NULL DEFAULT 0.00
+);
+
+CREATE TABLE fifo_layers (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  warehouse_id uuid NOT NULL REFERENCES warehouses(id),
+  item_id uuid NOT NULL REFERENCES items(id),
+  grn_line_id uuid NOT NULL REFERENCES grn_lines(id),
+  received_date date NOT NULL,
+  original_qty numeric(18,4) NOT NULL,
+  remaining_qty numeric(18,4) NOT NULL,
+  unit_cost numeric(19,6) NOT NULL
+);
+CREATE INDEX fifo_layers_tenant_idx ON fifo_layers (tenant_id, warehouse_id, item_id, received_date);
+
+SELECT app.enable_tenant_rls('uoms');
+SELECT app.enable_tenant_rls('uom_conversions');
+SELECT app.enable_tenant_rls('warehouses');
+SELECT app.enable_tenant_rls('items');
+SELECT app.enable_tenant_rls('suppliers');
+SELECT app.enable_tenant_rls('purchase_orders');
+SELECT app.enable_tenant_rls('po_lines');
+SELECT app.enable_tenant_rls('grn');
+SELECT app.enable_tenant_rls('grn_lines');
+SELECT app.enable_tenant_rls('stock_ledger');
+SELECT app.enable_tenant_rls('stock_balances');
+SELECT app.enable_tenant_rls('stock_counts');
+SELECT app.enable_tenant_rls('stock_count_lines');
+SELECT app.enable_tenant_rls('stock_adjustments');
+SELECT app.enable_tenant_rls('stock_transfers');
+SELECT app.enable_tenant_rls('recipes');
+SELECT app.enable_tenant_rls('recipe_lines');
+SELECT app.enable_tenant_rls('fifo_layers');
 ```
 
-**Invariant triggers (DB, not just app):**
-```sql
--- 1. Immutable ledger
-CREATE FUNCTION forbid_mutation() RETURNS trigger LANGUAGE plpgsql AS
-$$ BEGIN RAISE EXCEPTION 'append-only table %', TG_TABLE_NAME; END $$;
-CREATE TRIGGER gl_immutable BEFORE UPDATE OR DELETE ON gl_entries
-  FOR EACH ROW EXECUTE FUNCTION forbid_mutation();
-
--- 2. Balanced at COMMIT (deferred constraint trigger)
-CREATE FUNCTION assert_voucher_balanced() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE d numeric; c numeric; BEGIN
-  SELECT coalesce(sum(debit),0), coalesce(sum(credit),0) INTO d, c
-    FROM gl_entries WHERE voucher_id = NEW.voucher_id;
-  IF d <> c THEN RAISE EXCEPTION 'VOUCHER_UNBALANCED % vs %', d, c; END IF; RETURN NULL; END $$;
-CREATE CONSTRAINT TRIGGER gl_balanced AFTER INSERT ON gl_entries
-  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION assert_voucher_balanced();
-
--- 3. Period lock: BEFORE INSERT ON gl_entries → reject if fiscal_periods.status = 'closed'
-```
-
-### 9.3 Posting rules (configurable)
-
-```sql
-CREATE TABLE posting_rules (
-  id uuid PRIMARY KEY, tenant_id uuid NOT NULL, branch_id uuid,
-  event_type text NOT NULL,       -- 'folio.charge','folio.payment','fnb.sale','fnb.cogs','stock.grn','stock.issue',...
-  match jsonb NOT NULL DEFAULT '{}',   -- {"charge_group":"room"} | {"payment_method":"cash"}
-  voucher_type_code text NOT NULL, mode text NOT NULL DEFAULT 'per_document',  -- or 'daily_summary'
-  lines jsonb NOT NULL,           -- [{"side":"D","account":"1200-GUEST-LEDGER"},{"side":"C","account":"4100-ROOM-REV","amount":"net"},{"side":"C","account":"2300-VAT-OUT","amount":"tax"}]
-  priority int DEFAULT 100, enabled boolean DEFAULT true
-);
-```
-
-Default hotel mappings (templates; all editable):
-
-| Event | Debit | Credit |
-|---|---|---|
-| Room charge (night audit) | Guest Ledger (AR-guest) | Room Revenue; Tax/Service payable |
-| Advance deposit received | Cash/Bank | Customer Deposits (liability) |
-| Deposit applied at checkout | Customer Deposits | Guest Ledger |
-| Guest payment at checkout | Cash/Bank/Card clearing | Guest Ledger |
-| Transfer to city ledger | City Ledger (AR-corporate) | Guest Ledger |
-| Restaurant sale (cash) | Cash/Card clearing | F&B Revenue; Tax/Service payable |
-| Restaurant sale (room charge) | Guest Ledger | F&B Revenue; Tax/Service payable |
-| Recipe depletion (COGS) | COGS – F&B | Inventory – Food |
-| GRN received | Inventory | GRNI / Accounts Payable |
-| Supplier bill | GRNI | Accounts Payable |
-| Supplier payment (PV) | Accounts Payable | Cash/Bank |
-| Stock issue to dept | Dept. Expense | Inventory |
-| Stock adjustment (loss) | Inventory Adjustment Expense | Inventory |
-| Cash variance (shift close) | Cash Over/Short | Cash |
-
-### 9.4 Posting algorithm (normative)
-1. Source document finalises inside the DB transaction.
-2. `PostingService.post(event, payload)` selects the highest-priority matching rule for tenant/branch, builds voucher lines (rounding differences go to a configured rounding account), validates accounts are active/postable.
-3. If the voucher type needs approval and the rule is not `auto_approve`, the voucher is left `submitted` (source marked "pending accounting").
-4. `post()`: lock `fiscal_periods` row (`FOR SHARE`) → verify open → lock numbering sequence (`FOR UPDATE`) → assign `voucher_no` → insert `gl_entries` → update `gl_balances` → write audit + outbox `voucher.posted`.
-5. Any failure rolls back the source document too.
-
 ---
 
-## 10. API Surface (v1, illustrative)
+## 13. Accounting with Vouchering (USALI 12th Revised Edition)
 
-| Area | Endpoints |
-|---|---|
-| Auth | `POST /auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/mfa/verify`, `GET /me` |
-| UI config | `GET /ui/navigation`, `GET /ui/actions?entity=&id=`, `GET /ui/status-defs`, `GET /ui/custom-fields?entity=` |
-| Board | `GET /branches/:b/board?floor=&type=&status=` (units + status + current stay summary), `GET /events` (SSE) |
-| Units | `GET/POST /units`, `PATCH /units/:id`, `POST /units/:id/status`, `POST /units/:id/blocks` |
-| Availability | `GET /availability?branch&from&to&adults&children`, `GET /rates/quote` |
-| Reservations | `POST /reservations`, `GET /reservations/:id`, `PATCH`, `POST /:id/confirm|cancel|no-show|assign-unit|move` |
-| Stays | `POST /reservations/:id/check-in`, `POST /stays/:id/check-out`, `POST /stays/:id/room-move` |
-| Folio | `GET /folios/:id`, `POST /folios/:id/lines`, `POST /folios/:id/lines/:l/void`, `POST /folios/:id/transfer`, `POST /folios/:id/settle` |
-| Night audit | `POST /branches/:b/night-audit` (202), `GET /night-audits/:id` |
-| Housekeeping | `GET /hk/tasks`, `POST /hk/tasks/:id/start|finish`, `POST /maintenance-orders` |
-| Restaurant | `GET /outlets/:o/tables`, `POST /orders`, `POST /orders/:id/lines`, `POST /orders/:id/fire`, `POST /bills/:id/settle` |
-| Inventory | `GET/POST /items`, `POST /grn`, `POST /stock/issue|transfer|adjust|waste`, `POST /stock-counts`, `GET /stock/ledger` |
-| Accounting | `GET/POST /vouchers`, `POST /vouchers/:id/submit|approve|post|reverse`, `GET /coa`, `GET /periods`, `POST /periods/:id/close`, `GET /reports/trial-balance|gl|pnl|balance-sheet|ageing` |
-| Config | `GET/PUT /settings/:key?scope=`, CRUD for status-defs, action-defs, custom-fields, charge-codes, taxes, rate-plans, voucher-types, posting-rules |
-| Admin | `GET/POST /tenants`, `/branches`, `/users`, `/roles`, `/audit-log` |
-
-Common rules: tenant from host/JWT; branch via `X-Branch-Id` header (validated against membership); `Idempotency-Key` required on `POST` that create money/inventory/booking effects; `If-Match` on `PATCH/PUT`.
-
-Error codes (non-exhaustive): `ROOM_NOT_AVAILABLE`, `NO_INVENTORY`, `RESTRICTION_VIOLATED`, `STALE_VERSION`, `PERMISSION_DENIED`, `LIMIT_EXCEEDED`, `PERIOD_CLOSED`, `VOUCHER_UNBALANCED`, `ACCOUNT_NOT_POSTABLE`, `FOLIO_CLOSED`, `FOLIO_BALANCE_NOT_ZERO`, `NEGATIVE_STOCK`, `IDEMPOTENCY_CONFLICT`.
-
----
-
-## 11. State Machines
-
-**Reservation:** `hold → confirmed → in_house → checked_out`; `hold|confirmed → cancelled`; `confirmed → no_show`; `hold → expired(cancelled)`.
-**Unit (default flow):** `vacant_dirty → (clean) vacant_clean → (inspect) inspected → reserved/due_in → occupied → due_out → vacant_dirty`; `any → out_of_order|out_of_service → vacant_dirty` (on release). Transitions are data (`status_transitions`).
-**Voucher:** `draft → submitted → approved → posted`; `draft|submitted|approved → cancelled`; `posted → (reversed by new voucher)`.
-**Order:** `open → fired → served → billed → settled`; `any pre-settled → void` (with permission).
-**Night audit:** `pending → running(step n) → completed | failed(step n)` (resumable).
-
----
-
-## 12. Reports & KPIs
-
-- **Front office:** arrivals, departures, in-house, no-shows, occupancy %, ADR, RevPAR, pick-up, forecast, source/channel mix, room-status report, night-audit pack.
-- **Housekeeping:** productivity, rooms/attendant/hour, inspection fails, OOO log.
-- **F&B:** sales mix, voids/discounts, covers, average check, food cost % (theoretical vs actual).
-- **Inventory:** valuation, movement, ageing, usage variance, reorder.
-- **Accounting:** see REQ-ACC-015; all with branch and consolidated views, export to CSV/XLSX/PDF.
-- **Management dashboard:** per-branch tiles + consolidated; configurable widgets per role.
-
-Occupancy % = occupied unit-nights ÷ (sellable unit-nights − OOO nights); ADR = room revenue ÷ occupied; RevPAR = room revenue ÷ available unit-nights (formulas configurable for exclusions such as house-use/complimentary).
-
----
-
-## 13. Non-Functional Requirements
-
+### 13.1 Requirements
 | ID | Requirement |
 |---|---|
-| NFR-001 | p95 read < 300 ms, write < 600 ms at 100 concurrent users per tenant; board for 500 units renders < 1.5 s. |
-| NFR-002 | 99.9 % availability; RPO ≤ 5 min; RTO ≤ 1 h. |
-| NFR-003 | WCAG 2.2 AA; status never conveyed by colour alone. |
-| NFR-004 | Browser support: last 2 versions of Chrome, Edge, Safari, Firefox; responsive from 360 px (housekeeping on phones, tablet for front desk/POS). |
-| NFR-005 | Every list endpoint paginated; every report > 5 s runs async with notification. |
-| NFR-006 | All money exact decimal; rounding rules configurable (per currency, per tax). |
-| NFR-007 | Zero cross-tenant leakage verified by automated test on every migration. |
-| NFR-008 | Audit log retention ≥ 7 years (configurable); financial records never hard-deleted. |
-| NFR-009 | Localisation-ready (UTF-8, ICU, RTL-safe layout), multi-currency, tenant-defined date formats. |
-| NFR-010 | Light theme only; brand colour must pass contrast checks (≥ 4.5:1 text). |
+| REQ-ACC-001 | Double-entry invariant: Deferred constraint trigger enforcing `Σdebit = Σcredit` at transaction COMMIT. |
+| REQ-ACC-002 | Pre-seeded Chart of Accounts conforming to the **USALI 12th Revised Edition** standard hotel hierarchy. |
+| REQ-ACC-003 | Voucher lifecycle (`draft ➔ submitted ➔ approved ➔ posted`) with gapless numbering assigned under row lock upon posting. |
+| REQ-ACC-004 | Immutable general ledger (`gl_entries`) protected by `BEFORE UPDATE OR DELETE` triggers. |
+| REQ-ACC-005 | Fiscal periods with period-lock triggers preventing posting into soft-closed or closed periods. |
+| REQ-ACC-006 | Automated posting rules (`posting_rules`) resolving event mappings in the caller's active database transaction. |
+
+### 13.2 Accounting Production DDL
+
+```sql
+CREATE TABLE coa_accounts (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  parent_id uuid REFERENCES coa_accounts(id),
+  type text NOT NULL CHECK (type IN ('asset','liability','equity','income','expense')),
+  normal_side char(1) NOT NULL CHECK (normal_side IN ('D','C')),
+  is_group boolean NOT NULL DEFAULT false,
+  is_control boolean NOT NULL DEFAULT false,
+  control_type text CHECK (control_type IN ('guest_ledger','city_ledger','ap','inventory','cash')),
+  department text, -- 'rooms','fnb','admin_general','it','marketing','pom','energy_water_waste'
+  currency char(3),
+  allowed_branch_ids uuid[],
+  active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX coa_accounts_tenant_idx ON coa_accounts (tenant_id, code);
+
+CREATE TABLE fiscal_years (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  year int NOT NULL,
+  start_date date NOT NULL,
+  end_date date NOT NULL,
+  is_closed boolean NOT NULL DEFAULT false,
+  UNIQUE (tenant_id, year)
+);
+
+CREATE TABLE fiscal_periods (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  fiscal_year_id uuid NOT NULL REFERENCES fiscal_years(id) ON DELETE CASCADE,
+  fiscal_year int NOT NULL,
+  period_no int NOT NULL,
+  start_date date NOT NULL,
+  end_date date NOT NULL,
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','soft_closed','closed')),
+  UNIQUE (tenant_id, fiscal_year, period_no)
+);
+CREATE INDEX fiscal_periods_tenant_idx ON fiscal_periods (tenant_id, fiscal_year, period_no);
+
+CREATE TABLE voucher_types (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  code text NOT NULL,
+  name text NOT NULL,
+  prefix text NOT NULL,
+  reset_policy text NOT NULL DEFAULT 'yearly' CHECK (reset_policy IN ('monthly','yearly','never')),
+  requires_approval boolean NOT NULL DEFAULT false,
+  approval_threshold numeric(19,4) NOT NULL DEFAULT 0.0000,
+  is_system boolean NOT NULL DEFAULT false,
+  UNIQUE (tenant_id, code)
+);
+CREATE INDEX voucher_types_tenant_idx ON voucher_types (tenant_id, code);
+
+CREATE TABLE vouchers (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  voucher_type_id uuid NOT NULL REFERENCES voucher_types(id),
+  voucher_no text, -- Assigned under row lock upon posting
+  draft_ref text NOT NULL,
+  voucher_date date NOT NULL,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','submitted','approved','posted','cancelled')),
+  currency char(3) NOT NULL,
+  fx_rate numeric(18,8) NOT NULL DEFAULT 1.00000000,
+  narration text,
+  source_type text,
+  source_id uuid,
+  reversal_of uuid REFERENCES vouchers(id),
+  reversed_by uuid REFERENCES vouchers(id),
+  total_debit numeric(19,4) NOT NULL DEFAULT 0.0000,
+  total_credit numeric(19,4) NOT NULL DEFAULT 0.0000,
+  attrs jsonb NOT NULL DEFAULT '{}',
+  version int NOT NULL DEFAULT 1,
+  created_by uuid NOT NULL,
+  approved_by uuid,
+  posted_by uuid,
+  posted_at timestamptz,
+  UNIQUE (tenant_id, branch_id, voucher_type_id, voucher_no)
+);
+CREATE INDEX vouchers_tenant_branch_idx ON vouchers (tenant_id, branch_id, voucher_date, status);
+
+CREATE TABLE voucher_lines (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  voucher_id uuid NOT NULL REFERENCES vouchers(id) ON DELETE CASCADE,
+  line_no int NOT NULL,
+  account_id uuid NOT NULL REFERENCES coa_accounts(id),
+  debit numeric(19,4) NOT NULL DEFAULT 0.0000 CHECK (debit >= 0),
+  credit numeric(19,4) NOT NULL DEFAULT 0.0000 CHECK (credit >= 0),
+  party_type text CHECK (party_type IN ('guest','company','supplier')),
+  party_id uuid,
+  dimensions jsonb NOT NULL DEFAULT '{}',
+  narration text,
+  CHECK ((debit = 0) <> (credit = 0))
+);
+CREATE INDEX voucher_lines_tenant_voucher_idx ON voucher_lines (tenant_id, voucher_id);
+
+CREATE TABLE gl_entries (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  voucher_id uuid NOT NULL REFERENCES vouchers(id),
+  voucher_line_id uuid NOT NULL REFERENCES voucher_lines(id),
+  voucher_no text NOT NULL,
+  posting_date date NOT NULL,
+  fiscal_period_id uuid NOT NULL REFERENCES fiscal_periods(id),
+  account_id uuid NOT NULL REFERENCES coa_accounts(id),
+  debit numeric(19,4) NOT NULL DEFAULT 0.0000,
+  credit numeric(19,4) NOT NULL DEFAULT 0.0000,
+  party_type text,
+  party_id uuid,
+  dimensions jsonb NOT NULL DEFAULT '{}',
+  currency char(3) NOT NULL,
+  posted_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX gl_entries_tenant_account_idx ON gl_entries (tenant_id, account_id, posting_date);
+
+CREATE TABLE gl_balances (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  fiscal_period_id uuid NOT NULL REFERENCES fiscal_periods(id),
+  account_id uuid NOT NULL REFERENCES coa_accounts(id),
+  opening_balance numeric(19,4) NOT NULL DEFAULT 0.0000,
+  debit_sum numeric(19,4) NOT NULL DEFAULT 0.0000,
+  credit_sum numeric(19,4) NOT NULL DEFAULT 0.0000,
+  closing_balance numeric(19,4) NOT NULL DEFAULT 0.0000,
+  PRIMARY KEY (tenant_id, branch_id, fiscal_period_id, account_id)
+);
+CREATE INDEX gl_balances_tenant_idx ON gl_balances (tenant_id, branch_id, fiscal_period_id);
+
+CREATE TABLE posting_rules (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  event_type text NOT NULL, -- 'folio.charge','fnb.sale','stock.grn','stock.issue'
+  match jsonb NOT NULL DEFAULT '{}',
+  voucher_type_code text NOT NULL,
+  mode text NOT NULL DEFAULT 'per_document' CHECK (mode IN ('per_document','daily_summary')),
+  lines jsonb NOT NULL,
+  priority int NOT NULL DEFAULT 100,
+  enabled boolean NOT NULL DEFAULT true
+);
+CREATE INDEX posting_rules_tenant_event_idx ON posting_rules (tenant_id, event_type, priority);
+
+CREATE TABLE recurring_vouchers (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  template_voucher_id uuid NOT NULL REFERENCES vouchers(id),
+  schedule_cron text NOT NULL,
+  next_run_date date NOT NULL,
+  is_active boolean NOT NULL DEFAULT true
+);
+
+CREATE TABLE bank_statements (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  account_id uuid NOT NULL REFERENCES coa_accounts(id),
+  statement_date date NOT NULL,
+  statement_balance numeric(19,4) NOT NULL,
+  file_url text,
+  imported_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE bank_reconciliations (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  bank_statement_id uuid NOT NULL REFERENCES bank_statements(id),
+  gl_entry_id uuid REFERENCES gl_entries(id),
+  transaction_date date NOT NULL,
+  amount numeric(19,4) NOT NULL,
+  matched_at timestamptz,
+  matched_by uuid
+);
+
+-- Invariant triggers
+CREATE OR REPLACE FUNCTION app.forbid_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'Table % is strictly append-only; mutations are forbidden.', TG_TABLE_NAME;
+END $$;
+
+CREATE TRIGGER gl_immutable BEFORE UPDATE OR DELETE ON gl_entries
+  FOR EACH ROW EXECUTE FUNCTION app.forbid_mutation();
+
+CREATE OR REPLACE FUNCTION app.assert_voucher_balanced() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  v_debit numeric;
+  v_credit numeric;
+BEGIN
+  SELECT coalesce(sum(debit), 0), coalesce(sum(credit), 0) INTO v_debit, v_credit
+  FROM gl_entries WHERE voucher_id = NEW.voucher_id;
+  IF v_debit <> v_credit THEN
+    RAISE EXCEPTION 'VOUCHER_UNBALANCED: Debit % does not equal Credit % for voucher %', v_debit, v_credit, NEW.voucher_id;
+  END IF;
+  RETURN NULL;
+END $$;
+
+CREATE CONSTRAINT TRIGGER gl_balanced AFTER INSERT ON gl_entries
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.assert_voucher_balanced();
+
+SELECT app.enable_tenant_rls('coa_accounts');
+SELECT app.enable_tenant_rls('fiscal_years');
+SELECT app.enable_tenant_rls('fiscal_periods');
+SELECT app.enable_tenant_rls('voucher_types');
+SELECT app.enable_tenant_rls('vouchers');
+SELECT app.enable_tenant_rls('voucher_lines');
+SELECT app.enable_tenant_rls('gl_entries');
+SELECT app.enable_tenant_rls('gl_balances');
+SELECT app.enable_tenant_rls('posting_rules');
+SELECT app.enable_tenant_rls('recurring_vouchers');
+SELECT app.enable_tenant_rls('bank_statements');
+SELECT app.enable_tenant_rls('bank_reconciliations');
+```
 
 ---
 
-## 14. Acceptance Criteria (representative)
+## 14. Platform Infrastructure & Integrations
 
-1. **Race:** 100 concurrent requests to book the last unit for overlapping dates → exactly one succeeds; others receive `409`; DB contains no overlapping active rows.
-2. **Idempotency:** replaying the same `Idempotency-Key` returns the original reservation; no duplicate inventory decrement.
-3. **Isolation:** with context `tenant=A`, `SELECT * FROM reservations WHERE tenant_id = B` returns 0 rows; inserting a row with `tenant_id = B` fails.
-4. **Ledger:** inserting unbalanced `gl_entries` fails at COMMIT; UPDATE/DELETE on `gl_entries` raises; posting into a closed period raises `PERIOD_CLOSED`.
-5. **Board → action:** clicking a `due_in` tile shows *Check-in* (only with `reservation.stay.check_in`); a `vacant_dirty` tile shows *Set clean* and not *Check-in*; a tenant-added custom action appears with no deployment.
-6. **Folio → ledger:** posting a room charge via night audit creates one posted voucher that debits Guest Ledger and credits Room Revenue and Tax; Σ guest-ledger sub-ledger = control account.
-7. **Restaurant:** settling a room-charge bill creates a folio line, depletes recipe ingredients at WAC, posts revenue and COGS vouchers atomically; failure of any step leaves no partial data.
-8. **Inventory:** GRN of 10 @ 5.00 then 10 @ 7.00 gives valuation rate 6.00; issue of 5 reduces value by 30.00.
-9. **Period close:** closing a period with unapproved vouchers is refused with a list of offending vouchers.
-10. **Config:** changing a status colour or adding a custom status is visible on the board within seconds without reload (SSE `config.changed`).
-
----
-
-## 15. Seed Data Templates
-
-| Template | Contents |
+### 14.1 Requirements
+| ID | Requirement |
 |---|---|
-| Hotel | CoA (rooms, F&B, laundry, taxes, guest/city ledger, deposits, inventory, COGS), voucher types, default statuses, charge groups, roles, HK checklist |
-| Resort | Hotel + activities/spa charge groups, packages, multi-outlet F&B |
-| Apartments/Rentals | Monthly billing, security deposit liability, utilities charge codes, maintenance-heavy flows |
-| Restaurant add-on | Outlets, table layout, tax/service charge, base menu categories, COGS accounts |
+| REQ-INF-001 | Transactional Outbox pattern guaranteeing at-least-once event publication. |
+| REQ-INF-002 | Idempotent event inbox tracking preventing duplicate consumer reactions. |
+| REQ-INF-003 | Monthly partitioned audit logging capturing all security, money, and config changes. |
+| REQ-INF-004 | Two-way OpenTravel (OTA) / HTNG ARI channel manager synchronization. |
+| REQ-INF-005 | Hardware adapter protocols for keycard encoders (HTNG/FIAS) and thermal printers (ESC/POS). |
+| REQ-INF-006 | Fiscal e-invoicing export compliance (Philippines BIR EIS JSON & CAS / European Factur-X). |
+
+### 14.2 Platform Infrastructure Production DDL
+
+```sql
+CREATE TABLE audit_log (
+  id uuid NOT NULL,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  actor_id uuid,
+  action text NOT NULL,
+  entity text NOT NULL,
+  entity_id uuid NOT NULL,
+  diff jsonb NOT NULL DEFAULT '{}',
+  correlation_id text NOT NULL,
+  ip_address text,
+  user_agent text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, created_at, id)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE outbox_events (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  aggregate_type text NOT NULL,
+  aggregate_id text NOT NULL,
+  event_type text NOT NULL, -- e.g., 'reservation.created','voucher.posted'
+  payload jsonb NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','published','failed')),
+  retry_count int NOT NULL DEFAULT 0,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz
+);
+CREATE INDEX outbox_events_tenant_pending_idx ON outbox_events (tenant_id, status, created_at)
+  WHERE status = 'pending';
+
+CREATE TABLE inbox_events (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  consumer_group text NOT NULL,
+  event_id uuid NOT NULL,
+  processed_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, consumer_group, event_id)
+);
+CREATE INDEX inbox_events_tenant_idx ON inbox_events (tenant_id, consumer_group);
+
+CREATE TABLE idempotency_keys (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  key text NOT NULL,
+  request_hash text NOT NULL,
+  response_status int NOT NULL,
+  response_headers jsonb NOT NULL DEFAULT '{}',
+  response_body jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  UNIQUE (tenant_id, key)
+);
+CREATE INDEX idempotency_keys_tenant_idx ON idempotency_keys (tenant_id, key, expires_at);
+
+CREATE TABLE attachments (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid,
+  entity text NOT NULL, -- 'voucher','guest','maintenance'
+  entity_id uuid NOT NULL,
+  file_name text NOT NULL,
+  file_size bigint NOT NULL,
+  mime_type text NOT NULL,
+  s3_key text NOT NULL,
+  s3_url text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  uploaded_by uuid NOT NULL
+);
+CREATE INDEX attachments_tenant_entity_idx ON attachments (tenant_id, entity, entity_id);
+
+CREATE TABLE webhooks (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  endpoint_url text NOT NULL,
+  secret_key text NOT NULL,
+  subscribed_events text[] NOT NULL,
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX webhooks_tenant_idx ON webhooks (tenant_id);
+
+CREATE TABLE channel_maps (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  channel_name text NOT NULL, -- 'booking_com','expedia','agoda'
+  local_unit_type_id uuid NOT NULL REFERENCES unit_types(id),
+  local_rate_plan_id uuid NOT NULL REFERENCES rate_plans(id),
+  channel_room_code text NOT NULL,
+  channel_rate_code text NOT NULL,
+  is_active boolean NOT NULL DEFAULT true,
+  UNIQUE (tenant_id, branch_id, channel_name, channel_room_code, channel_rate_code)
+);
+CREATE INDEX channel_maps_tenant_idx ON channel_maps (tenant_id, branch_id, channel_name);
+
+CREATE TABLE channel_sync_logs (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  branch_id uuid NOT NULL REFERENCES branches(id),
+  channel_name text NOT NULL,
+  sync_type text NOT NULL CHECK (sync_type IN ('outbound_ari','inbound_booking')),
+  status text NOT NULL CHECK (status IN ('success','warning','failed')),
+  payload_summary jsonb NOT NULL DEFAULT '{}',
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX channel_sync_logs_tenant_idx ON channel_sync_logs (tenant_id, branch_id, created_at DESC);
+
+SELECT app.enable_tenant_rls('audit_log');
+SELECT app.enable_tenant_rls('outbox_events');
+SELECT app.enable_tenant_rls('inbox_events');
+SELECT app.enable_tenant_rls('idempotency_keys');
+SELECT app.enable_tenant_rls('attachments');
+SELECT app.enable_tenant_rls('webhooks');
+SELECT app.enable_tenant_rls('channel_maps');
+SELECT app.enable_tenant_rls('channel_sync_logs');
+```
+
+---
+
+## 15. Behavioral Specifications & State Machines
+
+### 15.1 Resumable Night Audit State Machine (GAPS §3.1)
+```
+[pending] ──► [pre_checks] ──► [room_tax_posting] ──► [fee_posting] ──► [date_roll] ──► [gl_vouchering] ──► [kpi_snapshot] ──► [completed]
+     │              │                  │                   │                │                │                 │
+     └──────────────┴──────────────────┴───────────────────┴────────────────┴────────────────┴─────────────────┴──► [failed]
+```
+1. **`pre_checks`**: Identifies un-checked arrivals (triggers auto no-show if past policy cutoff), departures with open folios, and unbilled POS orders. If critical blockers exist, audit pauses in `failed` with diagnostic report.
+2. **`room_tax_posting`**: Iterates active `stays` where `status = 'in_house'`. Atomically inserts room charge and tax lines to `folio_lines`. Idempotency guaranteed via composite unique index `(tenant_id, branch_id, stay_id, business_date, charge_type)`.
+3. **`fee_posting`**: Evaluates no-show fees, late checkout penalties, and recurring rental billing charges.
+4. **`date_roll`**: Atomically updates `branches.business_date = business_date + 1` and closes current `business_dates` record.
+5. **`gl_vouchering`**: Executes `PostingService.post()` in batch or document mode for the rolled date, generating balanced Journal Vouchers.
+6. **`kpi_snapshot`**: Computes occupancy %, ADR, RevPAR, and departmental revenues, recording the snapshot to `kpi_snapshots`.
+7. **Failure & Runbook Semantics**: Any unhandled exception halts execution, records step checkpoint to `night_audit_steps`, leaves `business_date` unchanged, and dispatches high-priority Slack/PagerDuty webhook alerts with runbook link. Resuming restarts strictly from the failed step.
+
+### 15.2 Background Lifecycle Workers (GAPS §3.2)
+1. **Hold Expiration Worker**: Executes every 60 seconds. Queries `holds WHERE expires_at < now()`. In one transaction: marks reservation status `cancelled`, decrements `room_type_inventory.sold`, and deletes hold row.
+2. **Auto No-Show Marker**: Runs 1 hour post-arrival cutoff (default 23:00 branch time). Marks un-checked reservations as `no_show`, applies rate plan no-show fee to folio, and releases `room_type_inventory`.
+3. **Late Checkout Fee Worker**: Evaluates departures past check-out policy grace period (e.g., > 12:00 PM). Generates half-day or full-day incidental charge based on policy definitions.
+
+### 15.3 Payment Lifecycle State Machine (GAPS §3.3)
+```
+[authorization] ──► [incremental_auth] ──► [capture] ──► [refund / partial_refund]
+       │                                       │
+       └──► [void / cancel]                    └──► [chargeback_dispute]
+```
+- **Pre-authorization**: Card-present or online token held upon check-in for estimated room & tax + incidental buffer.
+- **Incremental Auth**: Re-authorizes additional incidental buffer if folio balance exceeds 80% of authorized amount.
+- **Capture**: Settlement at checkout. Executes capture against gateway intent and writes `payments` row.
+- **Void vs Refund**: Voids occur before end-of-day gateway batch cut; refunds occur post-settlement and generate linked credit entries.
+
+### 15.4 Multi-Currency & Tax Engine Specification (GAPS §3.4)
+- **Exchange Rates**: Daily automated sync from central bank API into branch configuration.
+- **FX Gain/Loss**: Transacting in non-base currency records base equivalent at transaction date rate. Settlement in base currency compares rate differences and automatically generates Realized FX Gain/Loss vouchers.
+- **Tax Rounding Rules**: Configurable per jurisdiction: Philippine BIR requires document-level rounding to 2 decimal places; USALI supports line-level banker's rounding (`ROUND_HALF_EVEN`).
+
+---
+
+## 16. Complete API Surface (Selected Endpoints)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/auth/login` | Email/password authentication, returns JWT + sets refresh cookie |
+| `POST` | `/api/v1/auth/mfa/verify` | TOTP MFA verification challenge |
+| `GET`  | `/api/v1/ui/navigation` | Server-driven role-filtered navigation structure |
+| `GET`  | `/api/v1/ui/actions` | Server-evaluated action menu items for entity and ID |
+| `GET`  | `/api/v1/branches/:b/board` | Compact Rooms Board read model with ETag caching |
+| `GET`  | `/api/v1/events` | Server-Sent Events (SSE) streaming real-time status deltas |
+| `POST` | `/api/v1/reservations` | Create reservation (requires `Idempotency-Key`) |
+| `POST` | `/api/v1/stays/:id/check-out` | Settle folio balance and checkout guest stay |
+| `POST` | `/api/v1/folios/:id/lines` | Post charge or payment to guest folio (row-locked) |
+| `POST` | `/api/v1/branches/:b/night-audit` | Trigger resumable night audit execution (returns 202) |
+| `POST` | `/api/v1/orders/:id/fire` | Fire POS table order to kitchen stations (generates KOT) |
+| `POST` | `/api/v1/vouchers/:id/post` | Post balanced voucher under gapless numbering sequence lock |
+| `GET`  | `/api/v1/reports/trial-balance` | USALI-compliant real-time general ledger trial balance |
+
+---
+
+## 17. Acceptance Criteria & Quality Gates
+
+1. **Double-Booking Elimination:** 100 concurrent requests competing for 1 remaining unit results in exactly 1 HTTP 201 reservation and 99 HTTP 409 responses with zero overlapping database intervals.
+2. **Voucher Equilibrium:** Inserting an unbalanced voucher into `gl_entries` raises a deferred constraint exception (`VOUCHER_UNBALANCED`) at transaction `COMMIT`.
+3. **Ledger Immutability:** Any `UPDATE` or `DELETE` executed against `gl_entries` or `stock_ledger` raises a permission exception via database trigger.
+4. **Cross-Tenant Isolation:** Zero rows leak across tenants in automated leakage tests traversing all 108 tables in `pg_class`.
+5. **Night Audit Idempotency:** Executing night audit repeatedly for the same business date produces zero duplicate room or tax folio lines.

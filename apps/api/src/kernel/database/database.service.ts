@@ -14,9 +14,9 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       user: process.env.PGUSER_APP || 'innkeeper_app',
       password: process.env.PGPASSWORD_APP || 'innkeeper_app_pass',
       database: process.env.PGDATABASE || 'innkeeper',
-      max: 20,
+      max: 50,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 5000,
+      connectionTimeoutMillis: 10000,
     });
 
     // Test connection on startup
@@ -47,6 +47,20 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     fn: (client: pg.PoolClient) => Promise<T>,
   ): Promise<T> {
     return this.withTenantTransaction(tenantId, undefined, fn);
+  }
+
+  /**
+   * Execute a read callback on a pooled client with tenant context
+   */
+  async withTenantConnection<T>(
+    tenantId: string,
+    branchIds: string[] | undefined,
+    fn: (client: pg.PoolClient) => Promise<T>,
+  ): Promise<T> {
+    // Delegate to the transactional path so tenant/branch context is always
+    // transaction-local (`set_config(..., true)`) and never leaks across pooled
+    // connections (safe under PgBouncer transaction pooling).
+    return this.withTenantTransaction(tenantId, branchIds, fn);
   }
 
   /**

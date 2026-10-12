@@ -12,6 +12,7 @@ import type { Request } from 'express';
 import { SettingsService } from './settings.service.js';
 import { ZodValidationPipe } from '../../kernel/pipes/zod-validation.pipe.js';
 import { RequestContext } from '../../kernel/context/request-context.js';
+import { RequirePermissions } from '../iam/auth.decorators.js';
 import {
   UpdateSettingDtoSchema,
   type UpdateSettingDto,
@@ -28,8 +29,13 @@ export class SettingsController {
     @Query('scopeId') scopeId?: string,
   ) {
     const ctx = RequestContext.get();
-    const tenantId = ctx.tenantId || (req.headers['x-tenant-id'] as string) || 'a0000000-0000-0000-0000-000000000001';
+    const tenantId = RequestContext.getTenantId();
     return this.settingsService.getSettings(tenantId, { scopeType, scopeId });
+  }
+
+  @Get('registry')
+  getRegistry() {
+    return this.settingsService.getRegistry();
   }
 
   @Get('resolve')
@@ -40,8 +46,8 @@ export class SettingsController {
     @Query('outletId') outletId?: string,
   ) {
     const ctx = RequestContext.get();
-    const tenantId = ctx.tenantId || (req.headers['x-tenant-id'] as string) || 'a0000000-0000-0000-0000-000000000001';
-    const effectiveBranchId = branchId || ctx.branchId;
+    const tenantId = RequestContext.getTenantId();
+    const effectiveBranchId = branchId;
     const userId = ctx.userId;
 
     return this.settingsService.resolveSetting(tenantId, key, {
@@ -52,13 +58,14 @@ export class SettingsController {
   }
 
   @Put(':key')
+  @RequirePermissions('config.settings.update')
   async updateSetting(
     @Param('key') key: string,
     @Body(new ZodValidationPipe(UpdateSettingDtoSchema)) body: UpdateSettingDto,
     @Req() req: Request,
   ) {
     const ctx = RequestContext.get();
-    const tenantId = ctx.tenantId || (req.headers['x-tenant-id'] as string) || 'a0000000-0000-0000-0000-000000000001';
+    const tenantId = RequestContext.getTenantId();
     const userId = ctx.userId;
 
     return this.settingsService.updateSetting(tenantId, key, body, userId);

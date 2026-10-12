@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAppStore } from '../stores/useAppStore';
+import { apiFetch } from '../lib/http.js';
+import { DefinitionsManager } from './DefinitionsManager.js';
 
 interface SettingItem {
   id: string;
@@ -37,6 +39,22 @@ interface ActionDef {
   sort: number;
 }
 
+interface RegistryUiMeta {
+  control: 'select' | 'number' | 'text' | 'boolean';
+  options?: string[];
+  min?: number;
+  max?: number;
+  placeholder?: string;
+}
+
+interface RegistryEntry {
+  key: string;
+  description: string;
+  scopes: string[];
+  defaultValue: unknown;
+  ui?: RegistryUiMeta;
+}
+
 export const SettingsView: React.FC = () => {
   const queryClient = useQueryClient();
   const { activeTenantId, activeTenantName, activeBranchId, activeBranchName } = useAppStore();
@@ -45,79 +63,52 @@ export const SettingsView: React.FC = () => {
   const [selectedStatusForActions, setSelectedStatusForActions] = useState('due_in');
   const [numberingDocType, setNumberingDocType] = useState('reservation');
   const [lastGeneratedNumber, setLastGeneratedNumber] = useState<any>(null);
-
-  // Settings values local state for inputs
-  const [checkinRequireClean, setCheckinRequireClean] = useState('clean');
-  const [overbookingPct, setOverbookingPct] = useState(5);
-  const [roundingAccount, setRoundingAccount] = useState('9990-ROUNDING');
-  const [managerPin, setManagerPin] = useState('1234');
+  const [drafts, setDrafts] = useState<Record<string, unknown>>({});
   const [saveSuccessMsg, setSaveSuccessMsg] = useState('');
 
-  // 1. Fetch settings for current tenant
-  const { data: settingsList, isLoading: settingsLoading } = useQuery<SettingItem[]>({
+  // 1. Fetch the settings registry (authoritative catalogue of known keys)
+  const { data: registry } = useQuery<RegistryEntry[]>({
+    queryKey: ['settings-registry'],
+    queryFn: () => apiFetch<RegistryEntry[]>('/api/v1/settings/registry'),
+  });
+
+  // 2. Fetch current settings rows for the selected scope
+  const { data: settingsList } = useQuery<SettingItem[]>({
     queryKey: ['settings', activeTenantId, activeScope, activeBranchId],
-    queryFn: async () => {
+    queryFn: () => {
       const scopeParams =
         activeScope === 'branch'
           ? `?scopeType=branch&scopeId=${activeBranchId}`
           : `?scopeType=tenant`;
-      const res = await fetch(`/api/v1/settings${scopeParams}`, {
-        headers: { 'X-Tenant-Id': activeTenantId },
-      });
-      if (!res.ok) throw new Error('Failed to load settings');
-      return res.json();
+      return apiFetch<SettingItem[]>(`/api/v1/settings${scopeParams}`);
     },
   });
 
-  // 2. Fetch status definitions
+  // 3. Fetch status definitions
   const { data: statusDefs, isLoading: statusesLoading } = useQuery<StatusDef[]>({
     queryKey: ['ui-status-defs', activeTenantId, activeBranchId],
-    queryFn: async () => {
-      const res = await fetch(`/api/v1/ui/status-defs?entity=unit&branchId=${activeBranchId}`, {
-        headers: { 'X-Tenant-Id': activeTenantId, 'X-Branch-Id': activeBranchId },
-      });
-      if (!res.ok) throw new Error('Failed to load status defs');
-      return res.json();
-    },
+    queryFn: () =>
+      apiFetch<StatusDef[]>(`/api/v1/ui/status-defs?entity=unit&branchId=${activeBranchId}`),
   });
 
-  // 3. Fetch server-evaluated actions for selected status
+  // 4. Fetch server-evaluated actions for selected status
   const { data: evaluatedActions, isLoading: actionsLoading } = useQuery<ActionDef[]>({
     queryKey: ['ui-actions', activeTenantId, selectedStatusForActions, activeBranchId],
-    queryFn: async () => {
-      const res = await fetch(
+    queryFn: () =>
+      apiFetch<ActionDef[]>(
         `/api/v1/ui/actions?entity=unit&status=${selectedStatusForActions}&branchId=${activeBranchId}`,
-        {
-          headers: {
-            'X-Tenant-Id': activeTenantId,
-            'X-Branch-Id': activeBranchId,
-            'X-Permissions': '*',
-          },
-        },
-      );
-      if (!res.ok) throw new Error('Failed to load actions');
-      return res.json();
-    },
+      ),
   });
 
-  // 4. Mutation to update a setting
+  // 5. Mutation to update a setting
   const updateSettingMutation = useMutation({
-    mutationFn: async ({ key, value }: { key: string; value: any }) => {
+    mutationFn: ({ key, value }: { key: string; value: any }) => {
       const payload = {
         value,
         scopeType: activeScope,
         scopeId: activeScope === 'branch' ? activeBranchId : undefined,
       };
-      const res = await fetch(`/api/v1/settings/${key}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Tenant-Id': activeTenantId,
-        },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) throw new Error('Failed to update setting');
-      return res.json();
+      return apiFetch(`/api/v1/settings/${key}`, { method: 'PUT', body: payload });
     },
     onSuccess: (_, variables) => {
       setSaveSuccessMsg(`Saved '${variables.key}' at ${activeScope.toUpperCase()} scope!`);
@@ -126,27 +117,90 @@ export const SettingsView: React.FC = () => {
     },
   });
 
-  // 5. Mutation to generate gapless number
+  // 6. Mutation to generate gapless number
   const numberingMutation = useMutation({
-    mutationFn: async (docType: string) => {
-      const res = await fetch('/api/v1/numbering/next', {
+    mutationFn: (docType: string) =>
+      apiFetch('/api/v1/numbering/next', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Tenant-Id': activeTenantId,
-        },
-        body: JSON.stringify({
-          branchId: activeBranchId,
-          docType,
-        }),
-      });
-      if (!res.ok) throw new Error('Failed to generate number');
-      return res.json();
-    },
+        body: { branchId: activeBranchId, docType },
+      }),
     onSuccess: (data) => {
       setLastGeneratedNumber(data);
     },
   });
+
+  const changeScope = (scope: 'tenant' | 'branch') => {
+    setActiveScope(scope);
+    setDrafts({});
+  };
+
+  const rowsByKey = new Map((settingsList ?? []).map((s) => [s.key, s.value]));
+
+  const effectiveValue = (entry: RegistryEntry): unknown => {
+    if (drafts[entry.key] !== undefined) return drafts[entry.key];
+    if (rowsByKey.has(entry.key)) return rowsByKey.get(entry.key);
+    return entry.defaultValue;
+  };
+
+  const renderControl = (entry: RegistryEntry) => {
+    const control = entry.ui?.control ?? 'text';
+    const value = effectiveValue(entry);
+
+    if (control === 'select') {
+      return (
+        <select
+          className="form-select form-select-sm"
+          style={{ width: '150px' }}
+          value={String(value ?? '')}
+          onChange={(e) => setDrafts({ ...drafts, [entry.key]: e.target.value })}
+        >
+          {(entry.ui?.options ?? []).map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+      );
+    }
+
+    if (control === 'boolean') {
+      return (
+        <div className="form-check form-switch">
+          <input
+            className="form-check-input"
+            type="checkbox"
+            checked={Boolean(value)}
+            onChange={(e) => setDrafts({ ...drafts, [entry.key]: e.target.checked })}
+          />
+        </div>
+      );
+    }
+
+    if (control === 'number') {
+      return (
+        <input
+          type="number"
+          className="form-control form-control-sm"
+          style={{ width: '110px' }}
+          min={entry.ui?.min}
+          max={entry.ui?.max}
+          value={Number(value ?? 0)}
+          onChange={(e) => setDrafts({ ...drafts, [entry.key]: Number(e.target.value) })}
+        />
+      );
+    }
+
+    return (
+      <input
+        type="text"
+        className="form-control form-control-sm"
+        style={{ width: '160px' }}
+        placeholder={entry.ui?.placeholder}
+        value={String(value ?? '')}
+        onChange={(e) => setDrafts({ ...drafts, [entry.key]: e.target.value })}
+      />
+    );
+  };
 
   return (
     <div className="d-flex flex-column gap-4 p-4 max-w-7xl mx-auto">
@@ -155,10 +209,11 @@ export const SettingsView: React.FC = () => {
         <div>
           <h4 className="fw-bold text-dark mb-1 d-flex align-items-center gap-2">
             <i className="bi bi-gear-wide-connected text-primary" />
-            Configuration & Settings Engine
+            Configuration &amp; Settings Engine
           </h4>
           <p className="text-muted small mb-0">
-            Hierarchical settings resolution (Tenant ▸ Branch), live room status tokens, and server-driven action evaluations.
+            Registry-driven hierarchical settings (Tenant ▸ Branch), live room status tokens, and server-driven
+            action evaluations.
           </p>
         </div>
 
@@ -169,7 +224,7 @@ export const SettingsView: React.FC = () => {
             className={`btn btn-sm rounded-pill px-3 fw-semibold ${
               activeScope === 'tenant' ? 'btn-primary' : 'btn-light text-muted'
             }`}
-            onClick={() => setActiveScope('tenant')}
+            onClick={() => changeScope('tenant')}
           >
             <i className="bi bi-building me-1" />
             Tenant Scope: {activeTenantName}
@@ -179,7 +234,7 @@ export const SettingsView: React.FC = () => {
             className={`btn btn-sm rounded-pill px-3 fw-semibold ${
               activeScope === 'branch' ? 'btn-primary' : 'btn-light text-muted'
             }`}
-            onClick={() => setActiveScope('branch')}
+            onClick={() => changeScope('branch')}
           >
             <i className="bi bi-geo-alt me-1" />
             Branch Override: {activeBranchName}
@@ -191,6 +246,12 @@ export const SettingsView: React.FC = () => {
         <div className="alert alert-success py-2 px-3 small d-flex align-items-center gap-2 mb-0 shadow-sm">
           <i className="bi bi-check-circle-fill text-success" />
           <span>{saveSuccessMsg}</span>
+        </div>
+      )}
+      {updateSettingMutation.isError && (
+        <div className="alert alert-danger py-2 px-3 small d-flex align-items-center gap-2 mb-0 shadow-sm">
+          <i className="bi bi-exclamation-triangle-fill" />
+          <span>Failed to save setting. Check the value against its registered schema.</span>
         </div>
       )}
 
@@ -210,104 +271,57 @@ export const SettingsView: React.FC = () => {
             </div>
 
             <div className="card-body d-flex flex-column gap-3">
-              {/* Setting 1: Require Clean Room */}
-              <div className="p-3 rounded border bg-light-subtle d-flex justify-content-between align-items-center">
-                <div>
-                  <div className="fw-semibold text-dark small mb-0">frontdesk.checkin.requireCleanRoom</div>
-                  <span className="text-muted" style={{ fontSize: '0.78rem' }}>
-                    Requires unit to be marked clean or inspected prior to guest check-in.
-                  </span>
-                </div>
-                <div className="d-flex align-items-center gap-2">
-                  <select
-                    className="form-select form-select-sm"
-                    style={{ width: '130px' }}
-                    value={checkinRequireClean}
-                    onChange={(e) => setCheckinRequireClean(e.target.value)}
+              {(registry ?? []).map((entry) => {
+                const allowed = entry.scopes.includes(activeScope);
+                return (
+                  <div
+                    key={entry.key}
+                    className="p-3 rounded border bg-light-subtle d-flex justify-content-between align-items-center gap-3"
                   >
-                    <option value="clean">Clean</option>
-                    <option value="inspected">Inspected</option>
-                    <option value="none">None (Allow)</option>
-                  </select>
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-outline-primary"
-                    onClick={() =>
-                      updateSettingMutation.mutate({
-                        key: 'frontdesk.checkin.requireCleanRoom',
-                        value: checkinRequireClean,
-                      })
-                    }
-                  >
-                    Save
-                  </button>
-                </div>
-              </div>
-
-              {/* Setting 2: Overbooking Allowance */}
-              <div className="p-3 rounded border bg-light-subtle d-flex justify-content-between align-items-center">
-                <div>
-                  <div className="fw-semibold text-dark small mb-0">hotel.overbooking.allowancePct</div>
-                  <span className="text-muted" style={{ fontSize: '0.78rem' }}>
-                    Maximum permitted overbooking buffer during high season.
-                  </span>
-                </div>
-                <div className="d-flex align-items-center gap-2">
-                  <div className="input-group input-group-sm" style={{ width: '110px' }}>
-                    <input
-                      type="number"
-                      className="form-control"
-                      value={overbookingPct}
-                      onChange={(e) => setOverbookingPct(Number(e.target.value))}
-                    />
-                    <span className="input-group-text">%</span>
+                    <div className="flex-grow-1">
+                      <div className="fw-semibold text-dark small mb-0 font-monospace">{entry.key}</div>
+                      <span className="text-muted" style={{ fontSize: '0.78rem' }}>
+                        {entry.description}
+                      </span>
+                      <div className="mt-1">
+                        {entry.scopes.map((s) => (
+                          <span
+                            key={s}
+                            className={`badge me-1 ${
+                              s === activeScope
+                                ? 'bg-primary-subtle text-primary'
+                                : 'bg-light text-muted border'
+                            }`}
+                            style={{ fontSize: '0.65rem' }}
+                          >
+                            {s}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="d-flex align-items-center gap-2">
+                      {renderControl(entry)}
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-outline-primary"
+                        disabled={!allowed || updateSettingMutation.isPending}
+                        title={allowed ? 'Save' : `Not writable at ${activeScope} scope`}
+                        onClick={() =>
+                          updateSettingMutation.mutate({
+                            key: entry.key,
+                            value: effectiveValue(entry),
+                          })
+                        }
+                      >
+                        Save
+                      </button>
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-outline-primary"
-                    onClick={() =>
-                      updateSettingMutation.mutate({
-                        key: 'hotel.overbooking.allowancePct',
-                        value: overbookingPct,
-                      })
-                    }
-                  >
-                    Save
-                  </button>
-                </div>
-              </div>
-
-              {/* Setting 3: Manager Override PIN */}
-              <div className="p-3 rounded border bg-light-subtle d-flex justify-content-between align-items-center">
-                <div>
-                  <div className="fw-semibold text-dark small mb-0">security.manager_pin</div>
-                  <span className="text-muted" style={{ fontSize: '0.78rem' }}>
-                    Supervisor PIN code required for manager override modal authorizations.
-                  </span>
-                </div>
-                <div className="d-flex align-items-center gap-2">
-                  <input
-                    type="text"
-                    maxLength={8}
-                    className="form-control form-control-sm font-monospace"
-                    style={{ width: '100px' }}
-                    value={managerPin}
-                    onChange={(e) => setManagerPin(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-outline-primary"
-                    onClick={() =>
-                      updateSettingMutation.mutate({
-                        key: 'security.manager_pin',
-                        value: managerPin,
-                      })
-                    }
-                  >
-                    Save
-                  </button>
-                </div>
-              </div>
+                );
+              })}
+              {registry?.length === 0 && (
+                <div className="text-muted small">No settings registered.</div>
+              )}
             </div>
           </div>
         </div>
@@ -325,7 +339,8 @@ export const SettingsView: React.FC = () => {
             <div className="card-body d-flex flex-column justify-content-between">
               <div>
                 <p className="text-muted small mb-3">
-                  Thread-safe document numbering with row locks (<code>FOR UPDATE</code>) ensuring zero missing numbers for fiscal compliance.
+                  Thread-safe document numbering with row locks (<code>FOR UPDATE</code>) ensuring zero missing
+                  numbers for fiscal compliance.
                 </p>
 
                 <div className="mb-3">
@@ -380,7 +395,7 @@ export const SettingsView: React.FC = () => {
           <div>
             <h6 className="fw-bold text-dark mb-0 d-flex align-items-center gap-2">
               <i className="bi bi-palette text-primary" />
-              Room Status Definitions & Contrast-Checked Color Tokens
+              Room Status Definitions &amp; Contrast-Checked Color Tokens
             </h6>
             <span className="text-muted" style={{ fontSize: '0.78rem' }}>
               WCAG 2.2 AA compliant tokens (all badges have icons and labels; never color alone)
@@ -492,6 +507,9 @@ export const SettingsView: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Row 4: Editable Definitions Manager */}
+      <DefinitionsManager />
     </div>
   );
 };

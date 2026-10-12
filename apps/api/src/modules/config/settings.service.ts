@@ -1,10 +1,12 @@
-import { Injectable, Inject, NotFoundException } from '@nestjs/common';
+import { Injectable, Inject, NotFoundException, BadRequestException } from '@nestjs/common';
 import pg from 'pg';
 import { uuidv7 } from 'uuidv7';
 import { DatabaseService } from '../../kernel/database/database.service.js';
 import { OutboxService } from '../../kernel/outbox/outbox.service.js';
 import { AuditService } from '../../kernel/audit/audit.service.js';
+import { EventsService } from '../properties/events.service.js';
 import type { SettingDto, UpdateSettingDto } from '@innkeeper/contracts';
+import { SETTINGS_REGISTRY, SETTINGS_REGISTRY_BY_KEY } from '@innkeeper/config-schemas';
 
 interface CacheEntry {
   value: unknown;
@@ -21,6 +23,7 @@ export class SettingsService {
     @Inject(DatabaseService) private readonly db: DatabaseService,
     @Inject(OutboxService) private readonly outbox: OutboxService,
     @Inject(AuditService) private readonly audit: AuditService,
+    @Inject(EventsService) private readonly events: EventsService,
   ) {}
 
   private makeCacheKey(
@@ -103,6 +106,16 @@ export class SettingsService {
     });
   }
 
+  getRegistry() {
+    return SETTINGS_REGISTRY.map(({ key, description, scopes, defaultValue, ui }) => ({
+      key,
+      description,
+      scopes,
+      defaultValue,
+      ui,
+    }));
+  }
+
   async getSettings(
     tenantId: string,
     filter?: { scopeType?: string; scopeId?: string },
@@ -141,9 +154,29 @@ export class SettingsService {
     dto: UpdateSettingDto,
     userId?: string,
   ): Promise<SettingDto> {
-    return this.db.transaction(tenantId, async (client: pg.PoolClient) => {
+    const result = await this.db.transaction(tenantId, async (client: pg.PoolClient) => {
       const scopeType = dto.scopeType || 'tenant';
       const scopeId = dto.scopeId || null;
+
+      // Validate against the settings registry before persisting.
+      const definition = SETTINGS_REGISTRY_BY_KEY.get(key);
+      if (!definition) {
+        throw new BadRequestException(`Unknown setting key '${key}'`);
+      }
+      if (!definition.scopes.includes(scopeType as any)) {
+        throw new BadRequestException(
+          `Setting '${key}' cannot be written at scope '${scopeType}'`,
+        );
+      }
+      const parsed = definition.valueSchema.safeParse(dto.value);
+      if (!parsed.success) {
+        throw new BadRequestException({
+          error: 'invalid_setting_value',
+          message: `Value for '${key}' is invalid`,
+          details: parsed.error.issues,
+        });
+      }
+      const value = parsed.data;
 
       // Find existing
       const existing = await client.query(
@@ -162,14 +195,14 @@ export class SettingsService {
           `UPDATE settings
            SET value = $1, version = $2, updated_by = $3, updated_at = now()
            WHERE id = $4 AND tenant_id = $5`,
-          [JSON.stringify(dto.value), newVersion, userId || null, settingId, tenantId],
+          [JSON.stringify(value), newVersion, userId || null, settingId, tenantId],
         );
       } else {
         settingId = uuidv7();
         await client.query(
           `INSERT INTO settings (id, tenant_id, scope_type, scope_id, key, value, version, updated_by)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [settingId, tenantId, scopeType, scopeId, key, JSON.stringify(dto.value), 1, userId || null],
+          [settingId, tenantId, scopeType, scopeId, key, JSON.stringify(value), 1, userId || null],
         );
       }
 
@@ -185,7 +218,7 @@ export class SettingsService {
             key,
             scopeType,
             scopeId,
-            value: dto.value,
+            value: value,
             version: newVersion,
           },
         },
@@ -199,7 +232,7 @@ export class SettingsService {
           entityId: settingId,
           userId,
           tenantId,
-          afterDiff: { key, scopeType, scopeId, value: dto.value },
+          afterDiff: { key, scopeType, scopeId, value: value },
         },
         client,
       );
@@ -213,9 +246,21 @@ export class SettingsService {
         scopeType: scopeType as any,
         scopeId,
         key,
-        value: dto.value,
+        value: value,
         version: newVersion,
       };
     });
+
+    // Broadcast after the transaction commits so SSE clients refetch a
+    // consistent view. The worker outbox path alone never reaches in-process
+    // SSE subscribers, so this direct fan-out is required.
+    this.events.broadcast(tenantId, 'config.changed', {
+      key,
+      scopeType: result.scopeType,
+      scopeId: result.scopeId,
+      version: result.version,
+    });
+
+    return result;
   }
 }

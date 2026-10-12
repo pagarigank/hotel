@@ -1,13 +1,24 @@
 import React from 'react';
 import { useAppStore } from '../stores/useAppStore';
+import { useAuthStore } from '../stores/useAuthStore';
 
 interface TopBarProps {
   onOpenOverride: () => void;
 }
 
 const TENANTS = [
-  { id: 'a0000000-0000-0000-0000-000000000001', name: 'Acme Grand Hotel', branchId: 'b0000000-0000-0000-0000-000000000001', branchName: 'Manila Main Hotel' },
-  { id: 'a0000000-0000-0000-0000-000000000002', name: 'Boracay Paradise Resort', branchId: 'b0000000-0000-0000-0000-000000000002', branchName: 'Boracay Beachfront Resort' },
+  {
+    id: 'a0000000-0000-0000-0000-000000000001',
+    name: 'Acme Grand Hotel',
+    branchId: 'b0000000-0000-0000-0000-000000000001',
+    branchName: 'Manila Main Hotel',
+  },
+  {
+    id: 'a0000000-0000-0000-0000-000000000002',
+    name: 'Boracay Paradise Resort',
+    branchId: 'b0000000-0000-0000-0000-000000000002',
+    branchName: 'Boracay Beachfront Resort',
+  },
 ];
 
 export const TopBar: React.FC<TopBarProps> = ({ onOpenOverride }) => {
@@ -20,6 +31,15 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenOverride }) => {
     setTenant,
     setBranch,
   } = useAppStore();
+
+  const { user, roles, logout } = useAuthStore();
+  const roleLabel = roles[0] ? roles[0].charAt(0).toUpperCase() + roles[0].slice(1) : 'Member';
+  const initials = (user?.name ?? '?')
+    .split(' ')
+    .map((p) => p[0])
+    .slice(0, 2)
+    .join('')
+    .toUpperCase();
 
   const handleTenantChange = (tenantId: string) => {
     const t = TENANTS.find((x) => x.id === tenantId);
@@ -35,7 +55,12 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenOverride }) => {
         <div className="d-flex align-items-center gap-2">
           <div
             className="rounded-3 d-flex align-items-center justify-content-center text-white font-monospace fw-bold"
-            style={{ width: '36px', height: '36px', background: 'var(--brand)', fontSize: '1.1rem' }}
+            style={{
+              width: '36px',
+              height: '36px',
+              background: 'var(--brand)',
+              fontSize: '1.1rem',
+            }}
           >
             I
           </div>
@@ -96,13 +121,27 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenOverride }) => {
             className="rounded-circle bg-secondary-subtle text-secondary fw-bold d-flex align-items-center justify-content-center"
             style={{ width: '32px', height: '32px', fontSize: '0.85rem' }}
           >
-            AA
+            {initials || <i className="bi bi-person-fill" />}
           </div>
           <div className="d-flex flex-column text-start" style={{ lineHeight: '1.2' }}>
-            <span className="fw-semibold small">Acme Admin</span>
-            <span className="text-muted" style={{ fontSize: '0.75rem' }}>Administrator</span>
+            <span className="fw-semibold small">{user?.name || 'Guest'}</span>
+            <span className="text-muted" style={{ fontSize: '0.75rem' }}>
+              {roleLabel}
+            </span>
           </div>
         </div>
+
+        {/* Logout */}
+        <button
+          id="btn-logout"
+          type="button"
+          className="btn btn-sm btn-outline-secondary d-flex align-items-center gap-2 fw-semibold"
+          onClick={() => void logout()}
+          title="Sign out"
+        >
+          <i className="bi bi-box-arrow-right" />
+          Sign out
+        </button>
       </div>
     </header>
   );

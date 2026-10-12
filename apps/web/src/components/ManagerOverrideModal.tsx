@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { useAppStore } from '../stores/useAppStore';
+import { apiFetch } from '../lib/http';
 
 interface ManagerOverrideModalProps {
   isOpen: boolean;
@@ -8,8 +8,6 @@ interface ManagerOverrideModalProps {
 }
 
 export const ManagerOverrideModal: React.FC<ManagerOverrideModalProps> = ({ isOpen, onClose }) => {
-  const { activeTenantId } = useAppStore();
-
   const [managerEmail, setManagerEmail] = useState('admin@acme.com');
   const [managerPin, setManagerPin] = useState('1234');
   const [action, setAction] = useState('apply_folio_discount');
@@ -19,27 +17,16 @@ export const ManagerOverrideModal: React.FC<ManagerOverrideModalProps> = ({ isOp
 
   const overrideMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch('/api/v1/auth/manager-override', {
+      return apiFetch<any>('/api/v1/auth/manager-override', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Tenant-Id': activeTenantId,
-        },
-        body: JSON.stringify({
+        body: {
           managerEmail,
           managerPin,
           action,
           discountPct: Number(discountPct),
           reason,
-        }),
+        },
       });
-
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.detail || errorData.title || 'Manager override failed');
-      }
-
-      return res.json();
     },
     onSuccess: (data) => {
       setOverrideResult(data);
@@ -82,9 +69,13 @@ export const ManagerOverrideModal: React.FC<ManagerOverrideModalProps> = ({ isOp
                   <span className="fw-bold">Override Approved by {overrideResult.managerName}</span>
                 </div>
                 <p className="small mb-2 text-dark">
-                  High-priority audit log registered with transaction signature. Valid for 5 minutes.
+                  High-priority audit log registered with transaction signature. Valid for 5
+                  minutes.
                 </p>
-                <div className="p-2 bg-white rounded border font-monospace text-break" style={{ fontSize: '0.75rem' }}>
+                <div
+                  className="p-2 bg-white rounded border font-monospace text-break"
+                  style={{ fontSize: '0.75rem' }}
+                >
                   <span className="fw-bold text-muted">Token:</span> {overrideResult.overrideToken}
                 </div>
                 <div className="mt-3 text-end">
@@ -127,7 +118,10 @@ export const ManagerOverrideModal: React.FC<ManagerOverrideModalProps> = ({ isOp
 
                 <div className="mb-3">
                   <label className="form-label small fw-semibold text-muted">
-                    Manager PIN <span className="badge bg-secondary-subtle text-secondary ms-1">Default: 1234</span>
+                    Manager PIN{' '}
+                    <span className="badge bg-secondary-subtle text-secondary ms-1">
+                      Default: 1234
+                    </span>
                   </label>
                   <input
                     type="password"
@@ -166,7 +160,9 @@ export const ManagerOverrideModal: React.FC<ManagerOverrideModalProps> = ({ isOp
                 </div>
 
                 <div className="mb-3">
-                  <label className="form-label small fw-semibold text-muted">Mandatory Reason</label>
+                  <label className="form-label small fw-semibold text-muted">
+                    Mandatory Reason
+                  </label>
                   <textarea
                     rows={2}
                     className="form-control form-control-sm"
@@ -178,7 +174,11 @@ export const ManagerOverrideModal: React.FC<ManagerOverrideModalProps> = ({ isOp
                 </div>
 
                 <div className="d-flex justify-content-end gap-2 pt-2 border-top">
-                  <button type="button" className="btn btn-sm btn-outline-secondary" onClick={onClose}>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-secondary"
+                    onClick={onClose}
+                  >
                     Cancel
                   </button>
                   <button

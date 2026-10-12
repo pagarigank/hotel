@@ -18,6 +18,19 @@ VALUES
   ('11000000-0000-0000-0000-000000000008', 'a0000000-0000-0000-0000-000000000001', 'unit', 'out_of_order', 'Out of Order', 'status-ooo', 'bi-slash-circle', 80, false, false, false, true, 'OUT_OF_ORDER')
 ON CONFLICT (tenant_id, id) DO NOTHING;
 
+-- Tenant A Status Transitions
+INSERT INTO status_transitions (id, tenant_id, entity, from_code, to_code, permission, requires_reason)
+VALUES
+  ('15000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', 'unit', 'vacant_dirty', 'vacant_clean', 'housekeeping.status.update', false),
+  ('15000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000001', 'unit', 'vacant_clean', 'inspected', 'housekeeping.status.update', false),
+  ('15000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001', 'unit', 'vacant_clean', 'occupied', 'frontdesk.stay.checkin', false),
+  ('15000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000001', 'unit', 'due_in', 'occupied', 'frontdesk.stay.checkin', false),
+  ('15000000-0000-0000-0000-000000000005', 'a0000000-0000-0000-0000-000000000001', 'unit', 'occupied', 'due_out', 'frontdesk.stay.checkout', false),
+  ('15000000-0000-0000-0000-000000000006', 'a0000000-0000-0000-0000-000000000001', 'unit', 'due_out', 'vacant_dirty', 'frontdesk.stay.checkout', false),
+  ('15000000-0000-0000-0000-000000000007', 'a0000000-0000-0000-0000-000000000001', 'unit', 'vacant_clean', 'out_of_order', 'unit.status.block', true),
+  ('15000000-0000-0000-0000-000000000008', 'a0000000-0000-0000-0000-000000000001', 'unit', 'out_of_order', 'vacant_dirty', 'unit.status.block', false)
+ON CONFLICT (tenant_id, entity, from_code, to_code) DO NOTHING;
+
 -- Tenant A Action Definitions for Room Tiles
 INSERT INTO action_defs (id, tenant_id, entity, code, label, icon, group_code, permission, visible_when, target, sort)
 VALUES
@@ -61,5 +74,11 @@ INSERT INTO action_defs (id, tenant_id, entity, code, label, icon, group_code, p
 VALUES
   ('22000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 'unit', 'check_in', 'Villa Welcome Check-in', 'bi-box-arrow-in-right', 'frontdesk', 'frontdesk.stay.checkin', '{"statusIn":["vacant_clean"]}', '{"type":"wizard","key":"check-in"}', 10)
 ON CONFLICT (tenant_id, id) DO NOTHING;
+
+INSERT INTO status_transitions (id, tenant_id, entity, from_code, to_code, permission, requires_reason)
+VALUES
+  ('25000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 'unit', 'vacant_clean', 'occupied', 'frontdesk.stay.checkin', false),
+  ('25000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000002', 'unit', 'occupied', 'vacant_clean', 'frontdesk.stay.checkout', false)
+ON CONFLICT (tenant_id, entity, from_code, to_code) DO NOTHING;
 
 SELECT set_config('app.tenant_id', '', false);

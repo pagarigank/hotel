@@ -202,14 +202,17 @@ CREATE TABLE IF NOT EXISTS test_tenant_records (
 CREATE INDEX IF NOT EXISTS test_tenant_records_idx ON test_tenant_records (tenant_id, created_at);
 SELECT app.enable_tenant_rls('test_tenant_records');
 
--- Grant runtime permissions to innkeeper_app and innkeeper_readonly
-GRANT USAGE ON SCHEMA app TO innkeeper_app, innkeeper_readonly;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO innkeeper_app, innkeeper_readonly;
+-- Grant runtime permissions to innkeeper_app, innkeeper_readonly and innkeeper_worker
+GRANT USAGE ON SCHEMA app TO innkeeper_app, innkeeper_readonly, innkeeper_worker;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO innkeeper_app, innkeeper_readonly, innkeeper_worker;
 
-GRANT USAGE ON SCHEMA public TO innkeeper_app, innkeeper_readonly;
+GRANT USAGE ON SCHEMA public TO innkeeper_app, innkeeper_readonly, innkeeper_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO innkeeper_app;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO innkeeper_readonly;
+-- The outbox worker runs BYPASSRLS (not a request path); it only claims and updates events.
+GRANT SELECT, UPDATE ON ALL TABLES IN SCHEMA public TO innkeeper_worker;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO innkeeper_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO innkeeper_readonly;
-ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO innkeeper_app, innkeeper_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, UPDATE ON TABLES TO innkeeper_worker;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO innkeeper_app, innkeeper_readonly, innkeeper_worker;

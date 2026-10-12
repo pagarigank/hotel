@@ -4,9 +4,11 @@ import { NestFactory } from '@nestjs/core';
 import type { INestApplication } from '@nestjs/common';
 import { AppModule } from './app.module.js';
 import { ProblemFilter } from './kernel/errors/problem-filter.js';
+import { loginAs } from './test-utils/auth.js';
 
 describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
   let app: INestApplication;
+  let tokenA = '';
   const TENANT_A = 'a0000000-0000-0000-0000-000000000001';
   const TENANT_B = 'a0000000-0000-0000-0000-000000000002';
   const BRANCH_MNL = 'b0000000-0000-0000-0000-000000000001';
@@ -15,10 +17,30 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     app = await NestFactory.create(AppModule, { logger: false });
     app.useGlobalFilters(new ProblemFilter());
     await app.init();
+    tokenA = (await loginAs(app, 'admin@acme.com')).accessToken;
   });
 
   afterAll(async () => {
     await app.close();
+  });
+
+  describe('0. Authentication Enforcement (no header-trust identity)', () => {
+    it('Rejects protected request without access token with 401 problem+json', async () => {
+      const res = await request(app.getHttpServer()).get('/api/v1/roles');
+
+      expect(res.status).toBe(401);
+      expect(res.headers['content-type']).toContain('application/problem+json');
+    });
+
+    it('Ignores spoofed X-Tenant-Id header and derives tenant from token', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/api/v1/auth/me')
+        .set('Authorization', `Bearer ${tokenA}`)
+        .set('X-Tenant-Id', TENANT_B);
+
+      expect(res.status).toBe(200);
+      expect(res.body.tenant.id).toBe(TENANT_A);
+    });
   });
 
   describe('1. Multi-Tenant Authentication & Session Rotation', () => {
@@ -27,7 +49,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('POST /api/v1/auth/login validates credentials and issues JWT + rotating session', async () => {
       const res = await request(app.getHttpServer())
         .post('/api/v1/auth/login')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           email: 'admin@acme.com',
           password: 'Password123!',
@@ -53,7 +75,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('POST /api/v1/auth/login rejects invalid password with 401 problem+json', async () => {
       const res = await request(app.getHttpServer())
         .post('/api/v1/auth/login')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           email: 'admin@acme.com',
           password: 'WrongPassword!',
@@ -66,7 +88,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('POST /api/v1/auth/refresh rotates refresh token preventing replay attacks', async () => {
       const res = await request(app.getHttpServer())
         .post('/api/v1/auth/refresh')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({ refreshToken: currentRefreshToken });
 
       expect(res.status).toBe(201);
@@ -79,7 +101,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
       // Old refresh token must now be invalid!
       const replayRes = await request(app.getHttpServer())
         .post('/api/v1/auth/refresh')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({ refreshToken: currentRefreshToken });
 
       expect(replayRes.status).toBe(401);
@@ -90,8 +112,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('GET /api/v1/auth/me returns current user profile and tenant scope', async () => {
       const res = await request(app.getHttpServer())
         .get('/api/v1/auth/me')
-        .set('X-Tenant-Id', TENANT_A)
-        .set('X-User-Id', '10000000-0000-0000-0000-000000000001');
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(200);
       expect(res.body.user.email).toBe('admin@acme.com');
@@ -120,8 +141,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('POST /api/v1/auth/manager-override authorizes sensitive actions with PIN + audit log', async () => {
       const res = await request(app.getHttpServer())
         .post('/api/v1/auth/manager-override')
-        .set('X-Tenant-Id', TENANT_A)
-        .set('X-User-Id', '10000000-0000-0000-0000-000000000001')
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           managerEmail: 'admin@acme.com',
           managerPin: '1234',
@@ -139,7 +159,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('POST /api/v1/auth/manager-override rejects invalid PIN with 401', async () => {
       const res = await request(app.getHttpServer())
         .post('/api/v1/auth/manager-override')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           managerEmail: 'admin@acme.com',
           managerPin: '9999',
@@ -155,7 +175,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('GET /api/v1/roles lists tenant roles', async () => {
       const res = await request(app.getHttpServer())
         .get('/api/v1/roles')
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body)).toBe(true);
@@ -163,7 +183,9 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     });
 
     it('GET /api/v1/permissions returns system permission strings', async () => {
-      const res = await request(app.getHttpServer()).get('/api/v1/permissions');
+      const res = await request(app.getHttpServer())
+        .get('/api/v1/permissions')
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(200);
       expect(res.body.permissions).toContain('frontdesk.stay.checkin');
@@ -175,7 +197,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
       const code = `concierge_${Date.now()}`;
       const res = await request(app.getHttpServer())
         .post('/api/v1/roles')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           code,
           name: 'VIP Concierge',
@@ -193,7 +215,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('Resolves default tenant setting', async () => {
       const res = await request(app.getHttpServer())
         .get('/api/v1/settings/resolve?key=frontdesk.checkin.requireCleanRoom')
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(200);
       expect(res.body.value).toBe('clean');
@@ -204,7 +226,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
       // 1. Set branch override
       const putRes = await request(app.getHttpServer())
         .put('/api/v1/settings/frontdesk.checkin.requireCleanRoom')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           scopeType: 'branch',
           scopeId: BRANCH_MNL,
@@ -217,7 +239,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
       // 2. Resolve for branch -> inspected
       const resolveBranch = await request(app.getHttpServer())
         .get(`/api/v1/settings/resolve?key=frontdesk.checkin.requireCleanRoom&branchId=${BRANCH_MNL}`)
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(resolveBranch.status).toBe(200);
       expect(resolveBranch.body.value).toBe('inspected');
@@ -226,7 +248,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
       // 3. Resolve for tenant without branch -> still clean
       const resolveTenant = await request(app.getHttpServer())
         .get('/api/v1/settings/resolve?key=frontdesk.checkin.requireCleanRoom')
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(resolveTenant.status).toBe(200);
       expect(resolveTenant.body.value).toBe('clean');
@@ -238,7 +260,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('GET /api/v1/ui/status-defs returns unit status definitions', async () => {
       const res = await request(app.getHttpServer())
         .get('/api/v1/ui/status-defs?entity=unit')
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body)).toBe(true);
@@ -254,7 +276,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
       // For status 'due_in', check-in should be available
       const dueInRes = await request(app.getHttpServer())
         .get('/api/v1/ui/actions?entity=unit&status=due_in')
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(dueInRes.status).toBe(200);
       expect(dueInRes.body.some((a: any) => a.code === 'check_in')).toBe(true);
@@ -263,7 +285,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
       // For status 'vacant_dirty', mark clean should be available
       const dirtyRes = await request(app.getHttpServer())
         .get('/api/v1/ui/actions?entity=unit&status=vacant_dirty')
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(dirtyRes.status).toBe(200);
       expect(dirtyRes.body.some((a: any) => a.code === 'mark_clean')).toBe(true);
@@ -273,7 +295,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('GET /api/v1/ui/navigation returns server-driven navigation tree', async () => {
       const res = await request(app.getHttpServer())
         .get('/api/v1/ui/navigation')
-        .set('X-Tenant-Id', TENANT_A);
+        .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(200);
       expect(res.body.items).toBeDefined();
@@ -286,7 +308,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
     it('POST /api/v1/numbering/next generates sequential document numbers', async () => {
       const res1 = await request(app.getHttpServer())
         .post('/api/v1/numbering/next')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           branchId: BRANCH_MNL,
           docType: 'reservation',
@@ -298,7 +320,7 @@ describe('Phase 1: IAM & Configuration Engine Integration Tests', () => {
 
       const res2 = await request(app.getHttpServer())
         .post('/api/v1/numbering/next')
-        .set('X-Tenant-Id', TENANT_A)
+        .set('Authorization', `Bearer ${tokenA}`)
         .send({
           branchId: BRANCH_MNL,
           docType: 'reservation',

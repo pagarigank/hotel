@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Lint, build, migrate, test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: localhost
+      PGPORT: '5432'
+      PGDATABASE: innkeeper
+      PGUSER_OWNER: innkeeper_owner
+      PGPASSWORD_OWNER: innkeeper_owner_pass
+      PGUSER_APP: innkeeper_app
+      PGPASSWORD_APP: innkeeper_app_pass
+      PGUSER_WORKER: innkeeper_worker
+      PGPASSWORD_WORKER: innkeeper_worker_pass
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create databases and security roles
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -c "CREATE DATABASE innkeeper;"
+          psql -h localhost -U postgres -c "CREATE DATABASE innkeeper_test;"
+          psql -h localhost -U postgres -f scripts/setup-roles.sql
+          psql -h localhost -U postgres -c "ALTER DATABASE innkeeper_test OWNER TO innkeeper_owner;"
+
+      - name: Build workspace libraries
+        run: pnpm --filter "./packages/*" run build
+
+      - name: Run migrations (forward-only)
+        run: pnpm --filter @innkeeper/db run migrate
+
+      - name: Seed database
+        run: pnpm --filter @innkeeper/db run seed
+
+      - name: Lint / typecheck
+        run: pnpm -r run lint
+
+      - name: Unit tests
+        run: pnpm -r run test
+
+      - name: RLS leakage tests
+        run: pnpm --filter @innkeeper/db run test:rls
+
+      - name: Light-theme guard
+        run: pnpm run ci:guard:theme
+
+      - name: Production build
+        run: pnpm run build

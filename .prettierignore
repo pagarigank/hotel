@@ -1,0 +1,10 @@
+node_modules
+dist
+build
+coverage
+*.zip
+*.log
+*.sql
+pnpm-lock.yaml
+db/migrations
+db/seeds

@@ -27,9 +27,9 @@ export class IdempotencyInterceptor implements NestInterceptor {
       return next.handle();
     }
 
-    const ctx = RequestContext.get();
-    const tenantId = ctx.tenantId;
-    const userId = ctx.userId || '10000000-0000-0000-0000-000000000001';
+    const ctx = RequestContext.current();
+    const tenantId = ctx?.tenantId;
+    const userId = ctx?.userId;
 
     if (!tenantId) {
       return next.handle();

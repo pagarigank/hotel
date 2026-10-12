@@ -24,7 +24,7 @@ export class NumberingController {
     @Req() req: Request,
   ) {
     const ctx = RequestContext.get();
-    const tenantId = ctx.tenantId || (req.headers['x-tenant-id'] as string) || 'a0000000-0000-0000-0000-000000000001';
+    const tenantId = RequestContext.getTenantId();
 
     return this.numberingService.generateNextNumber(tenantId, body);
   }

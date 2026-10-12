@@ -1,9 +1,21 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAppStore } from './stores/useAppStore';
+import { useAuthStore } from './stores/useAuthStore';
 import { TopBar } from './components/TopBar';
 import { Sidebar } from './components/Sidebar';
+import { LoginPage } from './components/LoginPage';
+import { HomeMenuView } from './components/HomeMenuView';
+import { BoardGrid } from './components/BoardGrid';
 import { SettingsView } from './components/SettingsView';
+import { ReservationsListView } from './components/ReservationsListView';
+import { FrontDeskView } from './components/FrontDeskView';
+import { HousekeepingView } from './components/HousekeepingView';
+import { NightAuditView } from './components/NightAuditView';
+import { AccountingView } from './components/AccountingView';
+import { InventoryView } from './components/InventoryView';
+import { RestaurantView } from './components/RestaurantView';
+import { DashboardView } from './components/DashboardView';
 import { ManagerOverrideModal } from './components/ManagerOverrideModal';
 
 interface HealthData {
@@ -26,18 +38,32 @@ interface TestRecord {
 
 export function App() {
   const queryClient = useQueryClient();
-  const {
-    activeTenantId,
-    activeTenantName,
-    activeBranchId,
-    activeBranchName,
-    businessDate,
-  } = useAppStore();
+  const { activeTenantId, activeTenantName, activeBranchId, activeBranchName, businessDate } =
+    useAppStore();
 
-  const [currentTab, setCurrentTab] = useState<'settings' | 'records'>('settings');
+  const [currentTab, setCurrentTab] = useState<
+    | 'home'
+    | 'dashboard'
+    | 'board'
+    | 'reservations'
+    | 'frontdesk'
+    | 'housekeeping'
+    | 'nightaudit'
+    | 'accounting'
+    | 'inventory'
+    | 'restaurant'
+    | 'settings'
+    | 'records'
+  >('home');
   const [isOverrideModalOpen, setIsOverrideModalOpen] = useState(false);
   const [newTitle, setNewTitle] = useState('');
   const [newContent, setNewContent] = useState('');
+
+  const { status: authStatus, boot } = useAuthStore();
+
+  useEffect(() => {
+    void boot();
+  }, [boot]);
 
   // 1. Fetch Health Status
   const { data: health } = useQuery<HealthData>({
@@ -102,6 +128,25 @@ export function App() {
     createMutation.mutate({ title: newTitle, content: newContent });
   };
 
+  if (authStatus === 'idle' || authStatus === 'loading') {
+    return (
+      <div
+        className="d-flex align-items-center justify-content-center bg-light"
+        style={{ minHeight: '100vh' }}
+      >
+        <div className="text-center">
+          <div className="spinner-border text-primary mb-3" role="status" />
+          <p className="text-muted small mb-1">Innkeeper</p>
+          <p className="text-muted small">Restoring session...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus === 'anonymous') {
+    return <LoginPage />;
+  }
+
   return (
     <div className="app-shell d-flex flex-column bg-light" style={{ minHeight: '100vh' }}>
       {/* Top Bar with Scope & Branch Switcher */}
@@ -114,7 +159,27 @@ export function App() {
 
         {/* Content Area */}
         <main className="flex-grow-1 overflow-auto" style={{ minHeight: 'calc(100vh - 60px)' }}>
-          {currentTab === 'settings' ? (
+          {currentTab === 'home' ? (
+            <HomeMenuView onSelectTab={(t) => setCurrentTab(t as any)} />
+          ) : currentTab === 'dashboard' ? (
+            <DashboardView />
+          ) : currentTab === 'board' ? (
+            <BoardGrid />
+          ) : currentTab === 'reservations' ? (
+            <ReservationsListView />
+          ) : currentTab === 'frontdesk' ? (
+            <FrontDeskView />
+          ) : currentTab === 'housekeeping' ? (
+            <HousekeepingView />
+          ) : currentTab === 'nightaudit' ? (
+            <NightAuditView />
+          ) : currentTab === 'accounting' ? (
+            <AccountingView />
+          ) : currentTab === 'inventory' ? (
+            <InventoryView />
+          ) : currentTab === 'restaurant' ? (
+            <RestaurantView />
+          ) : currentTab === 'settings' ? (
             <SettingsView />
           ) : (
             <div className="p-4 max-w-7xl mx-auto d-flex flex-column gap-4">
@@ -128,9 +193,12 @@ export function App() {
                     <i className="bi bi-shield-shaded fs-5" />
                   </div>
                   <div>
-                    <h6 className="fw-bold mb-0 text-dark">Tenant Isolation & RLS Boundary Active</h6>
+                    <h6 className="fw-bold mb-0 text-dark">
+                      Tenant Isolation & RLS Boundary Active
+                    </h6>
                     <span className="text-muted small">
-                      Querying database as role <code>{health?.database.user || 'innkeeper_app'}</code> (NOBYPASSRLS enforced)
+                      Querying database as role{' '}
+                      <code>{health?.database.user || 'innkeeper_app'}</code> (NOBYPASSRLS enforced)
                     </span>
                   </div>
                 </div>
@@ -190,10 +258,13 @@ export function App() {
                   {recordsLoading ? (
                     <div className="text-muted small">Loading records...</div>
                   ) : recordsError ? (
-                    <div className="alert alert-danger py-2 small">{(recordsError as Error).message}</div>
+                    <div className="alert alert-danger py-2 small">
+                      {(recordsError as Error).message}
+                    </div>
                   ) : records?.length === 0 ? (
                     <div className="text-muted small py-3 text-center">
-                      No records found for {activeTenantName}. Records created here cannot leak to other tenants.
+                      No records found for {activeTenantName}. Records created here cannot leak to
+                      other tenants.
                     </div>
                   ) : (
                     <div className="table-responsive">
@@ -210,11 +281,17 @@ export function App() {
                         <tbody>
                           {records?.map((r) => (
                             <tr key={r.id}>
-                              <td className="font-monospace small text-muted">{r.id.slice(0, 8)}...</td>
+                              <td className="font-monospace small text-muted">
+                                {r.id.slice(0, 8)}...
+                              </td>
                               <td className="fw-semibold small">{r.title}</td>
                               <td className="small text-muted">{r.content || '—'}</td>
-                              <td className="font-monospace small text-muted">{r.tenantId.slice(0, 8)}...</td>
-                              <td className="small text-muted">{new Date(r.createdAt).toLocaleString()}</td>
+                              <td className="font-monospace small text-muted">
+                                {r.tenantId.slice(0, 8)}...
+                              </td>
+                              <td className="small text-muted">
+                                {new Date(r.createdAt).toLocaleString()}
+                              </td>
                             </tr>
                           ))}
                         </tbody>

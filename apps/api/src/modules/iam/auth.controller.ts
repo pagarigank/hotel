@@ -1,21 +1,16 @@
-import {
-  Controller,
-  Post,
-  Get,
-  Body,
-  Req,
-  Res,
-  Inject,
-  UsePipes,
-} from '@nestjs/common';
+import { Controller, Post, Get, Body, Req, Res, Inject } from '@nestjs/common';
+import { randomBytes } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { AuthService } from './auth.service.js';
+import { Public, SkipCsrf } from './auth.decorators.js';
 import { ZodValidationPipe } from '../../kernel/pipes/zod-validation.pipe.js';
 import { RequestContext } from '../../kernel/context/request-context.js';
 import {
+  CsrfTokenResponseSchema,
   LoginRequestSchema,
   RefreshTokenRequestSchema,
   ManagerOverrideRequestSchema,
+  type CsrfTokenResponse,
   type LoginRequest,
   type RefreshTokenRequest,
   type ManagerOverrideRequest,
@@ -25,6 +20,23 @@ import {
 export class AuthController {
   constructor(@Inject(AuthService) private readonly authService: AuthService) {}
 
+  @Public()
+  @SkipCsrf()
+  @Get('csrf')
+  csrf(@Res({ passthrough: true }) res: Response): CsrfTokenResponse {
+    const token = randomBytes(32).toString('base64url');
+    res.cookie('XSRF-TOKEN', token, {
+      httpOnly: false,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 60 * 60 * 1000,
+    });
+    return CsrfTokenResponseSchema.parse({ token });
+  }
+
+  @Public()
+  @SkipCsrf()
   @Post('login')
   async login(
     @Body(new ZodValidationPipe(LoginRequestSchema)) body: LoginRequest,
@@ -48,14 +60,19 @@ export class AuthController {
     return result;
   }
 
+  @Public()
+  @SkipCsrf()
   @Post('refresh')
   async refresh(
-    @Body(new ZodValidationPipe(RefreshTokenRequestSchema.optional())) body: RefreshTokenRequest | undefined,
+    @Body(new ZodValidationPipe(RefreshTokenRequestSchema.optional()))
+    body: RefreshTokenRequest | undefined,
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
     const refreshToken =
-      body?.refreshToken || (req.cookies && req.cookies['innkeeper_refresh_token']) || (req.headers['x-refresh-token'] as string);
+      body?.refreshToken ||
+      (req.cookies && req.cookies['innkeeper_refresh_token']) ||
+      (req.headers['x-refresh-token'] as string);
 
     if (!refreshToken) {
       return res.status(401).json({
@@ -67,8 +84,7 @@ export class AuthController {
       });
     }
 
-    const tenantId = req.headers['x-tenant-id'] as string;
-    const result = await this.authService.refresh(refreshToken, tenantId);
+    const result = await this.authService.refresh(refreshToken);
 
     res.cookie('innkeeper_refresh_token', result.refreshToken, {
       httpOnly: true,
@@ -80,11 +96,9 @@ export class AuthController {
     return result;
   }
 
+  @Public()
   @Post('logout')
-  async logout(
-    @Req() req: Request,
-    @Res({ passthrough: true }) res: Response,
-  ) {
+  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const refreshToken =
       (req.body && req.body.refreshToken) ||
       (req.cookies && req.cookies['innkeeper_refresh_token']) ||
@@ -99,23 +113,18 @@ export class AuthController {
   }
 
   @Get('me')
-  async me(@Req() req: Request) {
-    const ctx = RequestContext.get();
-    const userId = ctx.userId || (req.headers['x-user-id'] as string) || '10000000-0000-0000-0000-000000000001';
-    const tenantId = ctx.tenantId || (req.headers['x-tenant-id'] as string) || 'a0000000-0000-0000-0000-000000000001';
-
-    return this.authService.me(userId, tenantId);
+  async me() {
+    return this.authService.me(RequestContext.getUserId(), RequestContext.getTenantId());
   }
 
   @Post('manager-override')
   async managerOverride(
     @Body(new ZodValidationPipe(ManagerOverrideRequestSchema)) body: ManagerOverrideRequest,
-    @Req() req: Request,
   ) {
-    const ctx = RequestContext.get();
-    const tenantId = ctx.tenantId || (req.headers['x-tenant-id'] as string) || 'a0000000-0000-0000-0000-000000000001';
-    const currentUserId = ctx.userId || (req.headers['x-user-id'] as string) || '10000000-0000-0000-0000-000000000001';
-
-    return this.authService.managerOverride(body, tenantId, currentUserId);
+    return this.authService.managerOverride(
+      body,
+      RequestContext.getTenantId(),
+      RequestContext.getUserId(),
+    );
   }
 }

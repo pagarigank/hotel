@@ -10,10 +10,12 @@
     "dev:worker": "pnpm --filter @innkeeper/worker run dev",
     "dev:web": "pnpm --filter @innkeeper/web run dev",
     "lint": "pnpm -r run lint",
-    "test": "pnpm -r run test",
+    "test": "pnpm -r --workspace-concurrency=1 run test",
     "test:rls": "pnpm --filter @innkeeper/db run test:rls",
     "db:migrate": "pnpm --filter @innkeeper/db run migrate",
     "db:seed": "pnpm --filter @innkeeper/db run seed",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "ci:guard:theme": "node scripts/ci-guard-theme.mjs"
   },
   "devDependencies": {

@@ -12,9 +12,7 @@ import type {
   ManagerOverrideRequest,
   ManagerOverrideResponse,
 } from '@innkeeper/contracts';
-
-const JWT_SECRET = process.env.JWT_SECRET || 'innkeeper-dev-secret-key-1234567890';
-const ACCESS_TOKEN_EXPIRY = 900; // 15 minutes in seconds
+import { ACCESS_TOKEN_EXPIRY, getJwtSecret } from './jwt.constants.js';
 
 @Injectable()
 export class AuthService {
@@ -35,7 +33,7 @@ export class AuthService {
     roles: string[];
     permissions: string[];
   }): string {
-    return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
+    return jwt.sign(payload, getJwtSecret(), { expiresIn: ACCESS_TOKEN_EXPIRY });
   }
 
   async login(
@@ -139,9 +137,7 @@ export class AuthService {
         ? branches.map((b: any) => b.id)
         : Array.from(permittedBranchIdsSet);
 
-      const permittedBranches = branches.filter((b: any) =>
-        permittedBranchIds.length === 0 || permittedBranchIds.includes(b.id),
-      );
+      const permittedBranches = branches.filter((b: any) => permittedBranchIds.includes(b.id));
 
       // Issue rotating refresh token
       const refreshToken = uuidv7() + '-' + uuidv7();
@@ -203,7 +199,7 @@ export class AuthService {
     });
   }
 
-  async refresh(refreshToken: string, tenantId?: string): Promise<{ accessToken: string; refreshToken: string; expiresIn: number }> {
+  async refresh(refreshToken: string): Promise<{ accessToken: string; refreshToken: string; expiresIn: number }> {
     const tokenHash = this.hashRefreshToken(refreshToken);
 
     // Look up session via security-definer helper
@@ -433,7 +429,7 @@ export class AuthService {
           action: dto.action,
           tid: tenantId,
         },
-        JWT_SECRET,
+        getJwtSecret(),
         { expiresIn: 300 },
       );
 

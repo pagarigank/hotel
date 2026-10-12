@@ -1,8 +1,10 @@
 import { Controller, Get, HttpStatus, Res, Inject } from '@nestjs/common';
 import type { Response } from 'express';
+import { Public } from '../../modules/iam/auth.decorators.js';
 import { DatabaseService } from '../database/database.service.js';
 
 @Controller('health')
+@Public()
 export class HealthController {
   constructor(@Inject(DatabaseService) private readonly db: DatabaseService) {}
 
